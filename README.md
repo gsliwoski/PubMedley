@@ -4,6 +4,7 @@ Single call pipeline to:
 1. Query PubMed
 2. Filter for relevant hits if GCS Gemini or OpenAI API available
 3. Download full text PDF
+4. Repeatedly search with improved queries until desired number of articles are downloaded
 
 ## Purpose
 * Automatically search pubmed for articles of interest, filter results, and download full source PDFs
