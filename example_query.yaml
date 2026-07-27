@@ -1,0 +1,100 @@
+# Executable example for:
+#   python sources/pull_sources.py --query-yaml sources/example_query.yaml
+#
+# This example searches for comprehensive human reviews about sleep and memory.
+# Boolean operators may be nested to any depth. A plain string or `raw:` value
+# is passed through as PubMed syntax.
+
+query:
+  AND:
+    # First concept: sleep.
+    - OR:
+        - mesh_terms:
+            - Sleep
+            - Sleep Wake Disorders
+        - title:
+            - sleep
+        - title_abstract:
+            - sleep quality
+            - sleep duration
+
+    # Second concept: memory/cognition.
+    - OR:
+        - mesh_terms:
+            - Memory
+            - Cognition
+        - title:
+            - memory
+            - cognition
+        - title_abstract:
+            - memory consolidation
+            - cognitive function
+            - memor*
+
+    # Require review-like publications or titles.
+    - OR:
+        - publication_type:
+            - Review
+            - Systematic Review
+            - Meta-Analysis
+        - title:
+            - review
+            - overview
+            - synthesis
+        - title_abstract:
+            - state of the art
+
+    # Demonstrates NOT. These are also valid under exclusion_query below.
+    - NOT:
+        OR:
+          - title:
+              - protocol
+              - correction
+          - raw:
+              - editorial[Publication Type]
+
+filters:
+  free_full_text: true
+  full_text: false
+  has_abstract: true
+  humans: true
+  language:
+    - English
+  publication_date:
+    # These placeholders are calculated from --max-age and today's date.
+    oldest: "{oldest:%Y/%m/%d}"
+    current: "{current:%Y/%m/%d}"
+
+# Set true only when reusing the built-in human-intelligence title exclusions.
+# User --exclude terms and safe Gemini suggestions are incorporated regardless.
+use_default_exclusions: false
+
+# Optional structured exclusions. A raw string is also accepted, including:
+#   exclusion_query: '{exclusion_query}'
+exclusion_query:
+  OR:
+    - title:
+        - animal model
+        - rodent
+    - mesh_terms:
+        - Animals
+
+# Optional Gemini screening profile. If this entire section is omitted, the
+# script intelligently derives screening instructions from the compiled query.
+screening:
+  objective: >-
+    Find comprehensive reviews that synthesize how sleep affects human memory
+    or cognition.
+  approve_when:
+    - Sleep and memory or cognition are central topics, not incidental mentions.
+    - The article substantially reviews, compares, or integrates prior research.
+  reject_when:
+    - The article is an animal-only study.
+    - The article is a narrow intervention trial or isolated biomarker study.
+    - The article is a protocol, correction, editorial, or brief commentary.
+  positive_examples:
+    - A systematic review of sleep and memory consolidation in adults.
+
+# Other supported field keys include:
+# affiliation, article_identifier, author, book, first_author, isbn, journal,
+# keyword, language, last_author, mesh_major_topic, text_word, and raw.

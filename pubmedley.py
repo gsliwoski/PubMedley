@@ -1,0 +1,4971 @@
+#!/usr/bin/env python3
+"""Find and download long, free PubMed reviews.
+
+The search is performed against PubMed with relevance sorting.  PubMed does not
+provide a dependable page count, so every candidate PDF is downloaded to a
+temporary file, validated, counted, and retained only when it meets
+``--min-length``.
+
+This script was initially developed to find and download reviews on theories of human intelligence.
+Therefore, when no custom query or YAML is supplied, it defaults to searching for those articles.
+
+``--query`` accepts a raw PubMed base expression, while ``--query-yaml`` accepts
+a reusable structured query and optional LLM screening profile.
+
+Candidate records are screened by Gemini by default. Supplying
+``--openai-model`` instead uses OpenAI Structured Outputs and ``OPENAI_API_KEY``.
+PDF discovery first tries the current PubMed Central (PMC) AWS Open Data
+service, then legacy PMC and publisher routes. A persistent headless Chromium
+session follows full-text links and activates PDF downloads when direct HTTP
+discovery is insufficient.
+
+NCBI recommends identifying API clients.  Set ``NCBI_EMAIL`` and, optionally,
+``NCBI_API_KEY`` in the environment.  The script observes NCBI's lower anonymous
+request rate when no API key is configured.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import json
+import os
+import re
+import shlex
+import sys
+import tempfile
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from datetime import date
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, quote_plus, urljoin, urlparse, urlunparse
+
+try:
+    import requests
+    from pypdf import PdfReader
+    from tqdm import tqdm
+except ModuleNotFoundError as exc:  # pragma: no cover - exercised before startup
+    raise SystemExit(
+        f"Missing dependency {exc.name!r}. Install the packages listed in "
+        f"{Path(__file__).with_name('requirements.txt')}."
+    ) from exc
+
+
+EUTILS_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+PMC_OA_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+PMC_ARTICLE_BASE_URL = "https://pmc.ncbi.nlm.nih.gov/articles"
+PMC_AWS_BASE_URL = "https://pmc-oa-opendata.s3.amazonaws.com"
+TOOL_NAME = "PubMedley"
+USER_AGENT_VERSION = "1.0"
+EFETCH_BATCH_SIZE = 200
+GEMINI_BATCH_SIZE = 100
+GEMINI_REFINEMENT_REJECTION_RATE = 0.75
+GEMINI_MAX_SUGGESTED_EXCLUSIONS = 5
+MIN_AUTOMATIC_EXCLUSION_TITLE_MATCHES = 2
+MAX_AUTOMATIC_EXCLUSIONS_PER_ROUND = 5
+MAX_AUTOMATIC_EXCLUSIONS = 50
+DEFAULT_MAX_ROUNDS = 10
+MAX_PUBMED_RESULTS = 10_000
+DEFAULT_MAX_QUERY_LENGTH = 3_500
+MIN_MAX_QUERY_LENGTH = 500
+MAX_HTML_BYTES = 5 * 1024 * 1024
+MAX_PDF_BYTES = 2 * 1024 * 1024 * 1024
+MAX_QUERY_YAML_BYTES = 1024 * 1024
+CONTINUATION_STATE_VERSION = 1
+RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+DEFAULT_GEMINI_LOCATION = "global"
+BROWSER_MAX_PAGES_PER_ARTICLE = 12
+BROWSER_MAX_CLICK_TARGETS = 8
+MINIMUM_GEMINI_MODEL_VERSION = (3, 1)
+GEMINI_MODEL_VERSION_RE = re.compile(
+    r"(?:^|/)gemini-(\d+)\.(\d+)(?=$|[-.@])",
+    re.IGNORECASE,
+)
+
+YAML_FIELD_TAGS = {
+    "affiliation": "Affiliation",
+    "article_identifier": "Article Identifier",
+    "author": "Author",
+    "book": "Book",
+    "first_author": "First Author Name",
+    "isbn": "ISBN",
+    "journal": "Journal",
+    "keyword": "Other Term",
+    "language": "Language",
+    "last_author": "Last Author Name",
+    "mesh_major_topic": "MeSH Major Topic",
+    "mesh_terms": "MeSH Terms",
+    "publication_type": "Publication Type",
+    "text_word": "Text Word",
+    "title": "Title",
+    "title_abstract": "Title/Abstract",
+}
+
+PDF_ACTION_RE = re.compile(
+    r"\b(?:download|view|read|open)?\s*(?:the\s+|article\s+|full[- ]?text\s+)?pdf\b"
+    r"|\bpdf\s*(?:download|version|full[- ]?text)\b",
+    re.IGNORECASE,
+)
+FULL_TEXT_ACTION_RE = re.compile(
+    r"\b(?:open access|free full text|full text|publisher|cell press)\b",
+    re.IGNORECASE,
+)
+
+# These exclusions are part of the task, not the configurable --exclude list.
+# The CLI list adds to them.
+BUILTIN_TITLE_EXCLUSIONS = (
+    "artificial intelligence",
+    "artificial",
+    "ai",
+    "ai-driven",
+    "emotional intelligence",
+    "emotion intelligence",
+    "machine intelligence",
+    "machine",
+    "machines",
+    "computational intelligence",
+    "hybrid intelligence",
+    "augmented intelligence",
+    "business intelligence",
+    "machine learning",
+    "deep learning",
+    "large language model",
+    "neural network",
+    "robot intelligence",
+    "swarm intelligence",
+    "animal intelligence",
+    "rodent",
+    "nonhuman",
+    "correction",
+)
+
+TOPIC_TERMS = (
+    "human intelligence",
+    "general intelligence",
+    "general cognitive ability",
+    "theories of intelligence",
+    "theory of intelligence",
+    "models of intelligence",
+    "model of intelligence",
+    "structure of intelligence",
+    "intelligence theory",
+    "intelligence theories",
+    "cognitive abilities",
+    "cognitive ability",
+    "mental ability",
+    "mental abilities",
+    "intelligence",
+)
+
+HUMAN_INTELLIGENCE_EVIDENCE_TERMS = (
+    "human intelligence",
+    "general intelligence",
+    "general cognitive ability",
+    "theories of intelligence",
+    "theory of intelligence",
+    "models of intelligence",
+    "model of intelligence",
+    "structure of intelligence",
+    "intelligence theory",
+    "intelligence theories",
+    "g factor",
+    "general factor",
+    "psychometric",
+)
+
+THEORY_TERMS = (
+    "theory",
+    "theories",
+    "theoretical",
+    "model",
+    "models",
+    "framework",
+    "frameworks",
+    "psychometric",
+    "factor structure",
+    "g factor",
+    "general factor",
+    "cattell-horn-carroll",
+    "hierarchical",
+)
+
+REVIEW_TERMS = (
+    "review",
+    "overview",
+    "synthesis",
+    "state of the art",
+    "meta-analysis",
+    "metaanalysis",
+    "handbook",
+)
+
+COMPREHENSIVE_TITLE_TERMS = (
+    "human intelligence",
+    "general intelligence",
+    "theory",
+    "theories",
+    "theoretical",
+    "model",
+    "models",
+    "framework",
+    "frameworks",
+    "structure of intelligence",
+    "state of the art",
+    "review",
+    "overview",
+    "synthesis",
+)
+
+MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+
+class PubMedleyError(RuntimeError):
+    """Base exception for expected operational failures."""
+
+
+class RequestFailed(PubMedleyError):
+    """An HTTP request exhausted its permitted attempts."""
+
+    def __init__(self, url: str, attempts: int, reasons: Sequence[str]) -> None:
+        self.url = url
+        self.attempts = attempts
+        self.reasons = list(reasons)
+        super().__init__(
+            f"{url} failed after {attempts} attempt(s): " + "; ".join(self.reasons)
+        )
+
+
+class InvalidPdf(PubMedleyError):
+    """A response or file is not a usable PDF."""
+
+
+class StreamDownloadFailed(PubMedleyError):
+    """A PDF response failed after its headers were received."""
+
+
+class BrowserDownloadFailed(PubMedleyError):
+    """Headless-browser discovery exhausted its attempts."""
+
+
+@dataclass
+class Article:
+    """Normalized subset of a PubMed record plus its search rank."""
+
+    search_rank: int
+    pmid: str
+    title: str
+    abstract: str
+    journal: str
+    journal_abbreviation: str
+    publication_date: str | None
+    publication_year: int | None
+    publication_types: list[str]
+    authors: list[dict[str, str]]
+    language: list[str]
+    pagination: str | None
+    volume: str | None
+    issue: str | None
+    identifiers: dict[str, str]
+    keywords: list[str]
+    mesh_terms: list[str]
+    grants: list[dict[str, str]]
+
+    @property
+    def pmcid(self) -> str | None:
+        value = self.identifiers.get("pmc")
+        return value.upper() if value else None
+
+    @property
+    def doi(self) -> str | None:
+        return self.identifiers.get("doi")
+
+    @property
+    def pubmed_url(self) -> str:
+        return f"https://pubmed.ncbi.nlm.nih.gov/{self.pmid}/"
+
+    @property
+    def pmc_url(self) -> str | None:
+        return f"{PMC_ARTICLE_BASE_URL}/{self.pmcid}/" if self.pmcid else None
+
+
+@dataclass
+class Relevance:
+    """Explainable local relevance assessment."""
+
+    eligible: bool
+    score: int
+    matched_topic_terms: list[str] = field(default_factory=list)
+    matched_theory_terms: list[str] = field(default_factory=list)
+    matched_review_terms: list[str] = field(default_factory=list)
+    reason: str | None = None
+
+
+@dataclass
+class PdfCandidate:
+    """A possible direct PDF location and how it was discovered."""
+
+    url: str
+    source: str
+
+
+@dataclass
+class GeminiSelection:
+    """An LLM screening result, retaining the historical public type name."""
+
+    approved_pmids: set[str]
+    decisions: dict[str, dict[str, str]]
+    suggested_exclusions: list[str]
+    used: bool
+    fallback: bool
+    model: str
+    error: str | None = None
+    provider: str = "gemini"
+
+
+@dataclass
+class BrowserPdfResult:
+    """A PDF captured through Playwright."""
+
+    url: str
+    source: str
+    visited_urls: list[str]
+
+
+@dataclass
+class QueryPlan:
+    """A reusable query source plus its LLM screening profile."""
+
+    mode: str
+    raw_query: str | None = None
+    yaml_document: dict[str, Any] | None = None
+    screening_instructions: str | None = None
+    screening_is_query_derived: bool = False
+    prompt_filters: list[str] = field(default_factory=list)
+    source: str = "built-in intelligence query"
+    pmc_only: bool = False
+
+
+@dataclass
+class CandidateRound:
+    """One end-to-end batch ready for immediate download processing."""
+
+    round_number: int
+    query: str
+    continuation_query: str
+    articles: list[Article]
+    screenable_articles: list[Article]
+    missing_pmids: list[str]
+    gemini_selection: GeminiSelection
+    rank_by_pmid: dict[str, int]
+
+
+@dataclass
+class QueryBudgetResult:
+    """A PubMed query fitted to the configured encoded-length budget."""
+
+    query: str
+    original_encoded_length: int
+    encoded_length: int
+    compacted: bool = False
+    removed_alternatives: int = 0
+
+    @property
+    def modified(self) -> bool:
+        return self.compacted or self.removed_alternatives > 0
+
+
+@dataclass
+class CandidateSearchResult:
+    """Candidates accumulated across adaptive PubMed/LLM query rounds."""
+
+    articles: list[Article]
+    screenable_articles: list[Article]
+    missing_pmids: list[str]
+    gemini_selection: GeminiSelection
+    query_by_pmid: dict[str, str]
+    rank_by_pmid: dict[str, int]
+    round_by_pmid: dict[str, int]
+    query_rounds: list[dict[str, Any]]
+    automatically_applied_exclusions: list[str]
+    final_query: str
+    seen_pmids: list[str]
+    rounds_completed: int
+    stop_reason: str
+    max_rounds_exhausted: bool
+
+
+@dataclass
+class OutputFiles:
+    """Line-buffered run outputs so useful progress survives an interruption."""
+
+    failure_path: Path
+    success_path: Path
+    metadata_path: Path
+    append: bool = False
+    failure_handle: Any = field(init=False, repr=False)
+    success_handle: Any = field(init=False, repr=False)
+    metadata_handle: Any = field(init=False, repr=False)
+
+    def __enter__(self) -> OutputFiles:
+        for path in (self.failure_path, self.success_path, self.metadata_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if self.append else "w"
+        self.failure_handle = self.failure_path.open(
+            mode,
+            encoding="utf-8",
+            buffering=1,
+        )
+        self.success_handle = self.success_path.open(
+            mode,
+            encoding="utf-8",
+            buffering=1,
+        )
+        self.metadata_handle = self.metadata_path.open(
+            mode,
+            encoding="utf-8",
+            buffering=1,
+        )
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.failure_handle.close()
+        self.success_handle.close()
+        self.metadata_handle.close()
+
+    def success(self, title: str, url: str) -> None:
+        self.success_handle.write(
+            f"{clean_list_field(title)}\t{clean_list_field(url)}\n"
+        )
+
+    def failure(self, title: str, url: str, reason: str) -> None:
+        self.failure_handle.write(
+            f"{clean_list_field(title)}\t{clean_list_field(url)}\t"
+            f"{clean_list_field(reason)}\n"
+        )
+
+    def metadata(self, record: dict[str, Any]) -> None:
+        self.metadata_handle.write(
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        )
+
+
+class PdfLinkParser(HTMLParser):
+    """Collect likely PDF links without adding a full HTML dependency."""
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key.lower(): (value or "") for key, value in attrs}
+        if tag.lower() == "meta":
+            name = attributes.get("name", "").lower()
+            if name in {"citation_pdf_url", "eprints.document_url"}:
+                self._add(attributes.get("content", ""))
+            return
+
+        if tag.lower() != "a":
+            return
+        href = attributes.get("href", "")
+        link_type = attributes.get("type", "").lower()
+        if "pdf" in link_type or looks_like_pdf_url(href):
+            self._add(href)
+
+    def _add(self, value: str) -> None:
+        value = html.unescape(value).strip()
+        if not value:
+            return
+        absolute = urljoin(self.base_url, value)
+        if urlparse(absolute).scheme in {"http", "https", "ftp"}:
+            self.links.append(absolute)
+
+
+class HttpClient:
+    """Requests session with explicit retries, backoff, and NCBI throttling."""
+
+    def __init__(
+        self,
+        *,
+        retries: int,
+        timeout: float,
+        email: str | None,
+        api_key: str | None,
+    ) -> None:
+        self.retries = retries
+        self.timeout = timeout
+        self.email = email
+        self.api_key = api_key
+        self.ncbi_interval = 0.11 if api_key else 0.34
+        self.last_ncbi_request = 0.0
+        self.session = requests.Session()
+        identity = f"; mailto:{email}" if email else ""
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    f"{TOOL_NAME}/{USER_AGENT_VERSION}{identity}; "
+                    "+https://www.ncbi.nlm.nih.gov/home/develop/api/"
+                ),
+                "Accept": (
+                    "application/pdf,text/html,application/xml,"
+                    "application/json;q=0.9,*/*;q=0.5"
+                ),
+            }
+        )
+
+    def close(self) -> None:
+        self.session.close()
+
+    def ncbi_params(self) -> dict[str, str]:
+        params = {"tool": TOOL_NAME}
+        if self.email:
+            params["email"] = self.email
+        if self.api_key:
+            params["api_key"] = self.api_key
+        return params
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        retries: int | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        retry_count = self.retries if retries is None else retries
+        reasons: list[str] = []
+        attempts = retry_count + 1
+
+        for attempt in range(1, attempts + 1):
+            retry_after: float | None = None
+            self._throttle_if_ncbi(url)
+            try:
+                response = self.session.request(
+                    method,
+                    url,
+                    timeout=self.timeout,
+                    **kwargs,
+                )
+                if response.status_code in RETRYABLE_HTTP_STATUSES:
+                    reason = (
+                        f"HTTP {response.status_code} "
+                        f"{response.reason or 'retryable response'}"
+                    )
+                    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                    response.close()
+                    raise requests.HTTPError(
+                        reason,
+                        response=response,
+                    ) from None
+
+                response.raise_for_status()
+                return response
+            except (
+                requests.ConnectionError,
+                requests.Timeout,
+                requests.HTTPError,
+            ) as exc:
+                reasons.append(compact_error(exc))
+                error_response = getattr(exc, "response", None)
+                status = getattr(error_response, "status_code", None)
+                if error_response is not None:
+                    error_response.close()
+                if status is not None and status not in RETRYABLE_HTTP_STATUSES:
+                    break
+                if attempt >= attempts:
+                    break
+
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else min(2 ** (attempt - 1), 30)
+                )
+                tqdm.write(
+                    f"  retry {attempt}/{retry_count} for {url} in {delay:g}s: "
+                    f"{reasons[-1]}",
+                    file=sys.stdout,
+                )
+                time.sleep(delay)
+
+        raise RequestFailed(url, len(reasons), reasons)
+
+    def _throttle_if_ncbi(self, url: str) -> None:
+        hostname = (urlparse(url).hostname or "").lower()
+        if not (
+            hostname == "ncbi.nlm.nih.gov" or hostname.endswith(".ncbi.nlm.nih.gov")
+        ):
+            return
+        elapsed = time.monotonic() - self.last_ncbi_request
+        if elapsed < self.ncbi_interval:
+            time.sleep(self.ncbi_interval - elapsed)
+        self.last_ncbi_request = time.monotonic()
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Search PubMed by relevance for long, free reviews and download "
+            "qualifying PDFs. Defaults to theories of human intelligence."
+        )
+    )
+    query_group = parser.add_mutually_exclusive_group()
+    query_group.add_argument(
+        "--query",
+        help=(
+            "Custom PubMed base expression. The free-full-text and --max-age "
+            "constraints are appended automatically."
+        ),
+    )
+    query_group.add_argument(
+        "--query-yaml",
+        type=Path,
+        metavar="FILE.yaml",
+        help=(
+            "YAML instructions for building the PubMed query and optional "
+            "LLM screening criteria; see sources/example_query.yaml."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-filter",
+        action="append",
+        default=[],
+        metavar="TEXT|@FILE",
+        help=(
+            "Additional LLM screening instruction. Repeatable; prefix a "
+            "filename with @ to read longer instructions."
+        ),
+    )
+    parser.add_argument(
+        "--max-tries",
+        type=int,
+        default=100,
+        help=(
+            "Maximum qualifying-length download outcomes to try. LLM-rejected "
+            "and verified-short articles do not count (default: 100)."
+        ),
+    )
+    parser.add_argument(
+        "--max-articles",
+        type=int,
+        default=20,
+        help=(
+            "Stop after this many new qualifying PDFs have been downloaded "
+            "(default: 20)."
+        ),
+    )
+    parser.add_argument(
+        "--pmc-only",
+        action="store_true",
+        help=(
+            'Restrict PubMed results to articles available in PMC using '
+            '"pubmed pmc"[sb].'
+        ),
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=DEFAULT_MAX_ROUNDS,
+        help=(
+            "Maximum end-to-end PubMed/LLM/download rounds "
+            f"(default: {DEFAULT_MAX_ROUNDS})."
+        ),
+    )
+    parser.add_argument(
+        "--min-length",
+        type=int,
+        default=30,
+        metavar="PAGES",
+        help="Minimum number of PDF pages required (default: 30).",
+    )
+    parser.add_argument(
+        "--exclude",
+        default="",
+        metavar="TERM1,TERM2",
+        help=(
+            "Additional comma-separated title terms or phrases to exclude. "
+            "Built-in intelligence exclusions apply only to the default query."
+        ),
+    )
+    parser.add_argument(
+        "--max-age",
+        type=int,
+        default=10,
+        metavar="YEARS",
+        help="Oldest permitted publication age in years (default: 10).",
+    )
+    parser.add_argument(
+        "--max-query-length",
+        type=int,
+        default=DEFAULT_MAX_QUERY_LENGTH,
+        metavar="ENCODED_BYTES",
+        help=(
+            "Maximum URL-encoded PubMed query size before safe compaction or "
+            f"truncation (default: {DEFAULT_MAX_QUERY_LENGTH})."
+        ),
+    )
+    parser.add_argument(
+        "--failure-list",
+        default="failed_to_download.ls",
+        help="Failure-list filename or path (default: failed_to_download.ls).",
+    )
+    parser.add_argument(
+        "--success-list",
+        default="retrieved_articles.ls",
+        help="Success-list filename or path (default: retrieved_articles.ls).",
+    )
+    parser.add_argument(
+        "--metadata",
+        default="article_metadata.jsonl",
+        help="JSON Lines metadata filename or path (default: article_metadata.jsonl).",
+    )
+    parser.add_argument(
+        "--gemini-auth",
+        default="gemini_service_account.json",
+        help=(
+            "Gemini/Vertex AI service-account JSON filename or path "
+            "(default: gemini_service_account.json)."
+        ),
+    )
+    parser.add_argument(
+        "--gemini-model",
+        type=parse_gemini_model,
+        default=DEFAULT_GEMINI_MODEL,
+        help=(
+            f"Gemini 3.1 or later screening model (default: {DEFAULT_GEMINI_MODEL})."
+        ),
+    )
+    parser.add_argument(
+        "--openai-model",
+        help=(
+            "Use this OpenAI model with Structured Outputs for relevance "
+            "screening. Overrides Gemini and reads OPENAI_API_KEY."
+        ),
+    )
+    parser.add_argument(
+        "--gemini-location",
+        default=os.environ.get("GOOGLE_CLOUD_LOCATION", DEFAULT_GEMINI_LOCATION),
+        help=(
+            "Vertex AI location (default: GOOGLE_CLOUD_LOCATION or "
+            f"{DEFAULT_GEMINI_LOCATION})."
+        ),
+    )
+    parser.add_argument(
+        "--llm-report",
+        dest="llm_report",
+        default="llm_screening.json",
+        help=(
+            "LLM decisions and suggested exclusions filename or path "
+            "(default: llm_screening.json)."
+        ),
+    )
+    parser.add_argument(
+        "--gemini-report",
+        dest="llm_report",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--continuation-state",
+        default="PubMedley_continuation.json",
+        help=(
+            "Continuation-state filename or path atomically checkpointed after "
+            "every completed round "
+            "(default: PubMedley_continuation.json)."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        metavar="STATE.json",
+        help=(
+            "Resume from a continuation state, skipping every PMID already "
+            "terminally handled by the earlier run."
+        ),
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help=(
+            "Retries after the initial request, using exponential backoff (default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help=(
+            "Directory for PDFs and relative report paths "
+            "(default: the sources directory)."
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Per-request connect/read timeout in seconds (default: 60).",
+    )
+    parser.add_argument(
+        "--email",
+        default=os.environ.get("NCBI_EMAIL"),
+        help="Contact email sent to NCBI (default: NCBI_EMAIL environment variable).",
+    )
+    parser.add_argument(
+        "--ncbi-api-key",
+        default=os.environ.get("NCBI_API_KEY"),
+        help="NCBI API key (default: NCBI_API_KEY environment variable).",
+    )
+    args = parser.parse_args(argv)
+
+    if not 1 <= args.max_tries <= MAX_PUBMED_RESULTS:
+        parser.error(f"--max-tries must be between 1 and {MAX_PUBMED_RESULTS}")
+    if args.max_articles < 1:
+        parser.error("--max-articles must be at least 1")
+    if args.max_rounds < 1:
+        parser.error("--max-rounds must be at least 1")
+    if args.min_length < 1:
+        parser.error("--min-length must be at least 1")
+    if args.max_age < 0:
+        parser.error("--max-age cannot be negative")
+    if args.max_query_length < MIN_MAX_QUERY_LENGTH:
+        parser.error(f"--max-query-length must be at least {MIN_MAX_QUERY_LENGTH}")
+    if args.retries < 0:
+        parser.error("--retries cannot be negative")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+    if args.query is not None and not args.query.strip():
+        parser.error("--query cannot be empty")
+    if args.openai_model is not None:
+        args.openai_model = args.openai_model.strip()
+        if not args.openai_model or any(
+            character.isspace() for character in args.openai_model
+        ):
+            parser.error("--openai-model must be a non-empty model identifier")
+
+    try:
+        args.exclude_terms = parse_exclude_terms(args.exclude)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
+
+
+def parse_exclude_terms(raw: str) -> list[str]:
+    """Parse one CSV row so quoted phrases containing commas still work."""
+
+    if not raw.strip():
+        return []
+    try:
+        rows = list(csv.reader([raw], skipinitialspace=True))
+    except csv.Error as exc:
+        raise ValueError(f"invalid --exclude value: {exc}") from exc
+    terms = [normalize_space(term).casefold() for term in rows[0]]
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def parse_gemini_model(raw: str) -> str:
+    """Validate and normalize a Gemini model identifier."""
+
+    model = raw.strip()
+    match = GEMINI_MODEL_VERSION_RE.search(model)
+    if (
+        not model
+        or any(character.isspace() for character in model)
+        or match is None
+        or (int(match.group(1)), int(match.group(2))) < MINIMUM_GEMINI_MODEL_VERSION
+    ):
+        raise argparse.ArgumentTypeError(
+            "must identify a Gemini 3.1 or later model, such as 'gemini-3.1-pro'"
+        )
+    return model
+
+
+def subtract_years(value: date, years: int) -> date:
+    """Subtract calendar years while handling February 29."""
+
+    try:
+        return value.replace(year=value.year - years)
+    except ValueError:
+        return value.replace(year=value.year - years, day=28)
+
+
+def pubmed_title_clause(term: str) -> str:
+    escaped = term.replace("\\", " ").replace('"', " ")
+    return f'"{normalize_space(escaped)}"[Title]'
+
+
+def build_query(
+    max_age: int,
+    additional_exclusions: Sequence[str],
+    *,
+    today: date | None = None,
+) -> str:
+    """Build a constrained PubMed query; ESearch still controls relevance order."""
+
+    current = today or date.today()
+    oldest = subtract_years(current, max_age)
+    exclusions = list(
+        dict.fromkeys(
+            term.casefold()
+            for term in (*BUILTIN_TITLE_EXCLUSIONS, *additional_exclusions)
+        )
+    )
+    exclusion_query = " OR ".join(pubmed_title_clause(term) for term in exclusions)
+
+    return normalize_space(
+        f"""
+        (
+          "human intelligence"[Title]
+          OR "general intelligence"[Title]
+          OR "general cognitive ability"[Title]
+          OR "theories of intelligence"[Title]
+          OR "theory of intelligence"[Title]
+          OR "models of intelligence"[Title]
+          OR "model of intelligence"[Title]
+          OR "structure of intelligence"[Title]
+          OR "intelligence theory"[Title]
+          OR "intelligence theories"[Title]
+          OR "Cattell-Horn-Carroll"[Title]
+          OR "three-stratum theory"[Title]
+          OR "structure of intellect"[Title]
+          OR "fluid and crystallized intelligence"[Title]
+          OR "g factor"[Title]
+          OR (
+            intelligence[Title]
+            AND (
+              theor*[Title/Abstract]
+              OR model*[Title/Abstract]
+              OR framework*[Title/Abstract]
+              OR psychometric*[Title/Abstract]
+            )
+          )
+        )
+        AND
+        (
+          Review[Publication Type]
+          OR "Systematic Review"[Publication Type]
+          OR "Meta-Analysis"[Publication Type]
+          OR review[Title]
+          OR overview[Title]
+          OR synthesis[Title]
+          OR "state of the art"[Title/Abstract]
+        )
+        AND
+        (
+          Humans[MeSH Terms]
+          OR human*[Title/Abstract]
+        )
+        AND free full text[sb]
+        AND ("{oldest:%Y/%m/%d}"[Date - Publication]
+             : "{current:%Y/%m/%d}"[Date - Publication])
+        NOT ({exclusion_query})
+        """
+    )
+
+
+def load_query_yaml(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise PubMedleyError(f"could not read query YAML {path}: {exc}") from exc
+    if size > MAX_QUERY_YAML_BYTES:
+        raise PubMedleyError(
+            f"query YAML {path} exceeds the {MAX_QUERY_YAML_BYTES}-byte limit"
+        )
+    try:
+        import yaml
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise PubMedleyError(
+            "PyYAML is required for --query-yaml; install sources/requirements.txt"
+        ) from exc
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise PubMedleyError(f"invalid query YAML {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise PubMedleyError("query YAML must contain a top-level mapping")
+    allowed = {
+        "query",
+        "filters",
+        "exclusion_query",
+        "use_default_exclusions",
+        "screening",
+    }
+    unknown = set(payload) - allowed
+    if unknown:
+        raise PubMedleyError(
+            "unknown top-level query YAML key(s): " + ", ".join(sorted(unknown))
+        )
+    if "query" not in payload:
+        raise PubMedleyError("query YAML must contain a top-level 'query' value")
+    return payload
+
+
+def load_continuation_state(path: Path) -> dict[str, Any]:
+    """Load and validate a prior run's query and PMID ledger."""
+
+    path = path.expanduser().resolve()
+    try:
+        size = path.stat().st_size
+        if size > MAX_QUERY_YAML_BYTES:
+            raise PubMedleyError(
+                f"continuation state {path} exceeds the "
+                f"{MAX_QUERY_YAML_BYTES}-byte limit"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except PubMedleyError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PubMedleyError(
+            f"could not read continuation state {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PubMedleyError("continuation state must contain a JSON object")
+    if payload.get("version") != CONTINUATION_STATE_VERSION:
+        raise PubMedleyError(
+            "unsupported continuation-state version "
+            f"{payload.get('version')!r}; expected {CONTINUATION_STATE_VERSION}"
+        )
+    query = normalize_space(str(payload.get("current_query", "")))
+    if not query:
+        raise PubMedleyError("continuation state has no current_query")
+    raw_pmids = payload.get("completed_pmids", payload.get("seen_pmids"))
+    if not isinstance(raw_pmids, list):
+        raise PubMedleyError(
+            "continuation state completed_pmids must be a list"
+        )
+    completed_pmids = list(
+        dict.fromkeys(str(pmid).strip() for pmid in raw_pmids)
+    )
+    if any(not pmid.isdigit() for pmid in completed_pmids):
+        raise PubMedleyError(
+            "continuation state contains a non-numeric PMID"
+        )
+    payload["current_query"] = query
+    payload["completed_pmids"] = completed_pmids
+    return payload
+
+
+def write_continuation_state(
+    path: Path,
+    *,
+    status: str,
+    current_query: str,
+    completed_pmids: Iterable[str],
+    rounds_completed: int,
+    max_rounds_exhausted: bool,
+    query_plan: QueryPlan,
+    counts: Mapping[str, int] | None = None,
+) -> None:
+    """Persist enough state to continue without re-screening seen PMIDs."""
+
+    screening_instructions = (
+        query_plan.screening_instructions
+        or DEFAULT_INTELLIGENCE_SCREENING_INSTRUCTIONS
+    )
+    normalized_pmids = sorted(
+        {str(pmid) for pmid in completed_pmids},
+        key=int,
+    )
+    payload = {
+        "version": CONTINUATION_STATE_VERSION,
+        "status": status,
+        "current_query": current_query,
+        "completed_pmids": normalized_pmids,
+        "completed_pmid_count": len(normalized_pmids),
+        "rounds_completed": rounds_completed,
+        "max_rounds_exhausted": max_rounds_exhausted,
+        "query_mode": query_plan.mode,
+        "query_source": query_plan.source,
+        "screening_instructions": screening_instructions,
+        "counts": dict(counts or {}),
+    }
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def pubmed_yaml_term(value: Any, field_tag: str) -> str:
+    term = normalize_space(str(value))
+    if not term:
+        raise PubMedleyError(f"empty term for PubMed field {field_tag!r}")
+    if term.startswith('"') and term.endswith('"') and len(term) >= 2:
+        rendered = term
+    elif "*" in term and not re.search(r"\s", term):
+        rendered = term
+    else:
+        rendered = f'"{term.replace(chr(34), " ")}"'
+    return f"{rendered}[{field_tag}]"
+
+
+def compile_yaml_query_node(node: Any, *, path: str = "query") -> str:
+    """Compile the recursive YAML boolean/field DSL into PubMed syntax."""
+
+    if isinstance(node, str):
+        expression = normalize_space(node)
+        if not expression:
+            raise PubMedleyError(f"{path} contains an empty expression")
+        return expression
+    if isinstance(node, list):
+        if not node:
+            raise PubMedleyError(f"{path} cannot be an empty list")
+        children = [
+            compile_yaml_query_node(value, path=f"{path}[{index}]")
+            for index, value in enumerate(node)
+        ]
+        return "(" + " AND ".join(children) + ")"
+    if not isinstance(node, Mapping):
+        raise PubMedleyError(
+            f"{path} must be a mapping, list, or raw PubMed expression"
+        )
+    if not node:
+        raise PubMedleyError(f"{path} cannot be empty")
+
+    compiled: list[str] = []
+    for raw_key, value in node.items():
+        key = str(raw_key).strip()
+        normalized_key = key.casefold()
+        child_path = f"{path}.{key}"
+        if normalized_key in {"and", "or"}:
+            if not isinstance(value, list) or not value:
+                raise PubMedleyError(f"{child_path} must be a non-empty list")
+            children = [
+                compile_yaml_query_node(item, path=f"{child_path}[{index}]")
+                for index, item in enumerate(value)
+            ]
+            operator = normalized_key.upper()
+            compiled.append("(" + f" {operator} ".join(children) + ")")
+            continue
+        if normalized_key == "not":
+            child = compile_yaml_query_node(value, path=child_path)
+            compiled.append(f"NOT ({child})")
+            continue
+        if normalized_key == "raw":
+            raw_values = value if isinstance(value, list) else [value]
+            if not raw_values:
+                raise PubMedleyError(f"{child_path} cannot be empty")
+            raw_parts = [
+                compile_yaml_query_node(item, path=f"{child_path}[{index}]")
+                for index, item in enumerate(raw_values)
+            ]
+            compiled.append("(" + " OR ".join(raw_parts) + ")")
+            continue
+        field_tag = YAML_FIELD_TAGS.get(normalized_key)
+        if field_tag is None:
+            raise PubMedleyError(
+                f"unknown query YAML operator or field {key!r} at {path}"
+            )
+        values = value if isinstance(value, list) else [value]
+        if not values:
+            raise PubMedleyError(f"{child_path} cannot be empty")
+        field_parts = [pubmed_yaml_term(item, field_tag) for item in values]
+        compiled.append("(" + " OR ".join(field_parts) + ")")
+
+    return compiled[0] if len(compiled) == 1 else "(" + " AND ".join(compiled) + ")"
+
+
+def render_query_template(
+    value: Any,
+    *,
+    oldest: date,
+    current: date,
+    exclusion_query: str,
+) -> str:
+    if isinstance(value, date):
+        return value.strftime("%Y/%m/%d")
+    rendered = str(value)
+    replacements = {
+        "{oldest}": oldest.isoformat(),
+        "{oldest:%Y/%m/%d}": oldest.strftime("%Y/%m/%d"),
+        "{current}": current.isoformat(),
+        "{current:%Y/%m/%d}": current.strftime("%Y/%m/%d"),
+        "{exclusion_query}": exclusion_query,
+    }
+    for placeholder, replacement in replacements.items():
+        rendered = rendered.replace(placeholder, replacement)
+    unknown = re.findall(r"\{[^{}]+\}", rendered)
+    if unknown:
+        raise PubMedleyError(
+            "unsupported query YAML template placeholder(s): "
+            + ", ".join(sorted(set(unknown)))
+        )
+    return normalize_space(rendered)
+
+
+def compile_yaml_filters(
+    filters: Any,
+    *,
+    oldest: date,
+    current: date,
+    exclusion_query: str,
+) -> list[str]:
+    if filters is None:
+        return []
+    if not isinstance(filters, Mapping):
+        raise PubMedleyError("query YAML 'filters' must be a mapping")
+    allowed = {
+        "free_full_text",
+        "full_text",
+        "has_abstract",
+        "humans",
+        "language",
+        "pmc",
+        "publication_date",
+    }
+    unknown = set(filters) - allowed
+    if unknown:
+        raise PubMedleyError(
+            "unknown query YAML filter(s): " + ", ".join(sorted(unknown))
+        )
+
+    clauses: list[str] = []
+    boolean_filters = {
+        "free_full_text": "free full text[sb]",
+        "full_text": "full text[sb]",
+        "has_abstract": "hasabstract",
+        "humans": '"Humans"[MeSH Terms]',
+        "pmc": '"pubmed pmc"[sb]',
+    }
+    for name, clause in boolean_filters.items():
+        enabled = filters.get(name, False)
+        if not isinstance(enabled, bool):
+            raise PubMedleyError(f"query YAML filter {name!r} must be boolean")
+        if enabled:
+            clauses.append(clause)
+
+    if "language" in filters:
+        languages = filters["language"]
+        values = languages if isinstance(languages, list) else [languages]
+        if not values:
+            raise PubMedleyError("query YAML language filter cannot be empty")
+        clauses.append(
+            "("
+            + " OR ".join(
+                pubmed_yaml_term(language, YAML_FIELD_TAGS["language"])
+                for language in values
+            )
+            + ")"
+        )
+
+    if "publication_date" in filters:
+        publication_date = filters["publication_date"]
+        if not isinstance(publication_date, Mapping):
+            raise PubMedleyError(
+                "query YAML publication_date filter must be a mapping"
+            )
+        unknown_date_keys = set(publication_date) - {"oldest", "current"}
+        if unknown_date_keys:
+            raise PubMedleyError(
+                "unknown publication_date key(s): "
+                + ", ".join(sorted(unknown_date_keys))
+            )
+        if "oldest" not in publication_date or "current" not in publication_date:
+            raise PubMedleyError(
+                "publication_date requires both 'oldest' and 'current'"
+            )
+        oldest_value = render_query_template(
+            publication_date["oldest"],
+            oldest=oldest,
+            current=current,
+            exclusion_query=exclusion_query,
+        )
+        current_value = render_query_template(
+            publication_date["current"],
+            oldest=oldest,
+            current=current,
+            exclusion_query=exclusion_query,
+        )
+        clauses.append(
+            f'("{oldest_value}"[Date - Publication] : '
+            f'"{current_value}"[Date - Publication])'
+        )
+    return clauses
+
+
+def build_yaml_query(
+    document: Mapping[str, Any],
+    max_age: int,
+    additional_exclusions: Sequence[str],
+    *,
+    today: date | None = None,
+) -> str:
+    current = today or date.today()
+    oldest = subtract_years(current, max_age)
+    use_defaults = document.get("use_default_exclusions", False)
+    if not isinstance(use_defaults, bool):
+        raise PubMedleyError("use_default_exclusions must be boolean")
+    default_exclusions = BUILTIN_TITLE_EXCLUSIONS if use_defaults else ()
+    exclusion_terms = list(
+        dict.fromkeys(
+            term.casefold() for term in (*default_exclusions, *additional_exclusions)
+        )
+    )
+    generated_exclusion_query = " OR ".join(
+        pubmed_title_clause(term) for term in exclusion_terms
+    )
+    clauses = [compile_yaml_query_node(document["query"])]
+    clauses.extend(
+        compile_yaml_filters(
+            document.get("filters"),
+            oldest=oldest,
+            current=current,
+            exclusion_query=generated_exclusion_query,
+        )
+    )
+
+    exclusion_node = document.get("exclusion_query")
+    if exclusion_node is not None:
+        includes_generated_exclusions = False
+        if isinstance(exclusion_node, str):
+            includes_generated_exclusions = "{exclusion_query}" in exclusion_node
+            exclusion_expression = render_query_template(
+                exclusion_node,
+                oldest=oldest,
+                current=current,
+                exclusion_query=generated_exclusion_query,
+            )
+        else:
+            exclusion_expression = compile_yaml_query_node(
+                exclusion_node,
+                path="exclusion_query",
+            )
+        if generated_exclusion_query and not includes_generated_exclusions:
+            exclusion_expression = (
+                f"({exclusion_expression}) OR ({generated_exclusion_query})"
+                if exclusion_expression
+                else generated_exclusion_query
+            )
+        if exclusion_expression:
+            clauses.append(f"NOT ({exclusion_expression})")
+    elif generated_exclusion_query:
+        clauses.append(f"NOT ({generated_exclusion_query})")
+    return normalize_space(" AND ".join(f"({clause})" for clause in clauses))
+
+
+def build_raw_custom_query(
+    raw_query: str,
+    max_age: int,
+    additional_exclusions: Sequence[str],
+    *,
+    today: date | None = None,
+) -> str:
+    current = today or date.today()
+    oldest = subtract_years(current, max_age)
+    clauses = [
+        f"({normalize_space(raw_query)})",
+        "free full text[sb]",
+        (
+            f'("{oldest:%Y/%m/%d}"[Date - Publication] : '
+            f'"{current:%Y/%m/%d}"[Date - Publication])'
+        ),
+    ]
+    if additional_exclusions:
+        exclusion_query = " OR ".join(
+            pubmed_title_clause(term)
+            for term in dict.fromkeys(term.casefold() for term in additional_exclusions)
+        )
+        clauses.append(f"NOT ({exclusion_query})")
+    return normalize_space(" AND ".join(clauses))
+
+
+def generic_screening_instructions(source: str) -> str:
+    return f"""
+Infer the user's screening objective from this custom PubMed query:
+{source}
+
+Interpret PubMed field tags, quoted phrases, wildcards, Boolean groups, and NOT
+clauses semantically. Treat operational constraints such as publication dates,
+language, humans, abstracts, and full-text availability as search constraints,
+not as the scientific topic.
+
+Approve an article only when its main subject is centrally relevant to the
+inferred scientific objective and it is a substantial review, synthesis,
+overview, theoretical framework, or comparable comprehensive treatment. Reject
+incidental keyword matches, narrow empirical studies, corrections, editorials,
+protocols, and unrelated uses of ambiguous search terms.
+""".strip()
+
+
+def yaml_screening_instructions(
+    document: Mapping[str, Any],
+    *,
+    source: str,
+) -> str:
+    screening = document.get("screening")
+    if screening is None:
+        return generic_screening_instructions(source)
+    if isinstance(screening, str):
+        instructions = screening.strip()
+        if not instructions:
+            raise PubMedleyError("query YAML screening instructions are empty")
+        return instructions
+    if not isinstance(screening, Mapping):
+        raise PubMedleyError("query YAML 'screening' must be text or a mapping")
+    allowed = {
+        "objective",
+        "approve_when",
+        "reject_when",
+        "positive_examples",
+    }
+    unknown = set(screening) - allowed
+    if unknown:
+        raise PubMedleyError(
+            "unknown query YAML screening key(s): " + ", ".join(sorted(unknown))
+        )
+    objective = normalize_space(str(screening.get("objective", "")))
+    if not objective:
+        raise PubMedleyError("query YAML screening.objective is required")
+    lines = [f"Screening objective: {objective}"]
+    for key, heading in (
+        ("approve_when", "Approve when"),
+        ("reject_when", "Reject when"),
+        ("positive_examples", "Strong positive examples"),
+    ):
+        values = screening.get(key, [])
+        values = values if isinstance(values, list) else [values]
+        cleaned = [
+            normalize_space(str(value)) for value in values if str(value).strip()
+        ]
+        if cleaned:
+            lines.append(heading + ":")
+            lines.extend(f"- {value}" for value in cleaned)
+    return "\n".join(lines)
+
+
+def load_prompt_filters(values: Sequence[str]) -> list[str]:
+    filters: list[str] = []
+    for raw_value in values:
+        if raw_value.startswith("@"):
+            path_text = raw_value[1:].strip()
+            if not path_text:
+                raise PubMedleyError("--prompt-filter @FILE requires a filename")
+            path = Path(path_text).expanduser().resolve()
+            try:
+                size = path.stat().st_size
+                if size > MAX_QUERY_YAML_BYTES:
+                    raise PubMedleyError(
+                        f"prompt filter file {path} exceeds the "
+                        f"{MAX_QUERY_YAML_BYTES}-byte limit"
+                    )
+                value = path.read_text(encoding="utf-8")
+            except PubMedleyError:
+                raise
+            except (OSError, UnicodeError) as exc:
+                raise PubMedleyError(
+                    f"could not read prompt filter file {path}: {exc}"
+                ) from exc
+        else:
+            value = raw_value
+        value = normalize_space(value)
+        if not value:
+            raise PubMedleyError("--prompt-filter cannot be empty")
+        filters.append(value)
+    return filters
+
+
+def append_prompt_filters(
+    base_instructions: str,
+    prompt_filters: Sequence[str],
+) -> str:
+    if not prompt_filters:
+        return base_instructions
+    additions = "\n".join(f"- {value}" for value in prompt_filters)
+    return (
+        f"{base_instructions}\n\nAdditional user-supplied screening filters:\n"
+        f"{additions}"
+    )
+
+
+def prepare_query_plan(args: argparse.Namespace) -> QueryPlan:
+    prompt_filters = load_prompt_filters(args.prompt_filter)
+    if args.query_yaml is not None:
+        document = load_query_yaml(args.query_yaml)
+        source = str(args.query_yaml.expanduser().resolve())
+        compiled_query = build_yaml_query(
+            document,
+            args.max_age,
+            args.exclude_terms,
+        )
+        instructions = yaml_screening_instructions(
+            document,
+            source=f"Compiled YAML PubMed expression: {compiled_query}",
+        )
+        return QueryPlan(
+            mode="yaml",
+            yaml_document=document,
+            screening_instructions=append_prompt_filters(
+                instructions,
+                prompt_filters,
+            ),
+            screening_is_query_derived=document.get("screening") is None,
+            prompt_filters=prompt_filters,
+            source=source,
+            pmc_only=args.pmc_only,
+        )
+    if args.query is not None:
+        raw_query = normalize_space(args.query)
+        instructions = generic_screening_instructions(raw_query)
+        return QueryPlan(
+            mode="raw",
+            raw_query=raw_query,
+            screening_instructions=append_prompt_filters(
+                instructions,
+                prompt_filters,
+            ),
+            screening_is_query_derived=True,
+            prompt_filters=prompt_filters,
+            source="--query",
+            pmc_only=args.pmc_only,
+        )
+    return QueryPlan(
+        mode="default",
+        screening_instructions=(
+            append_prompt_filters(
+                DEFAULT_INTELLIGENCE_SCREENING_INSTRUCTIONS,
+                prompt_filters,
+            )
+            if prompt_filters
+            else None
+        ),
+        prompt_filters=prompt_filters,
+        pmc_only=args.pmc_only,
+    )
+
+
+def build_query_for_plan(
+    plan: QueryPlan,
+    max_age: int,
+    additional_exclusions: Sequence[str],
+    *,
+    today: date | None = None,
+) -> str:
+    if plan.mode == "default":
+        query = build_query(
+            max_age,
+            additional_exclusions,
+            today=today,
+        )
+    elif plan.mode == "raw" and plan.raw_query is not None:
+        query = build_raw_custom_query(
+            plan.raw_query,
+            max_age,
+            additional_exclusions,
+            today=today,
+        )
+    elif plan.mode == "yaml" and plan.yaml_document is not None:
+        query = build_yaml_query(
+            plan.yaml_document,
+            max_age,
+            additional_exclusions,
+            today=today,
+        )
+    elif plan.mode == "compiled" and plan.raw_query is not None:
+        clauses = [f"({normalize_space(plan.raw_query)})"]
+        if additional_exclusions:
+            exclusion_query = " OR ".join(
+                pubmed_title_clause(term)
+                for term in dict.fromkeys(
+                    term.casefold() for term in additional_exclusions
+                )
+            )
+            clauses.append(f"NOT ({exclusion_query})")
+        query = normalize_space(" AND ".join(clauses))
+    else:
+        raise PubMedleyError(f"invalid query plan mode {plan.mode!r}")
+
+    if plan.pmc_only and not re.search(
+        r'"?pubmed\s+pmc"?\s*\[(?:sb|filter)\]',
+        query,
+        flags=re.IGNORECASE,
+    ):
+        query = normalize_space(f"({query}) AND \"pubmed pmc\"[sb]")
+    return query
+
+
+PUBMED_FIELD_COMPACTIONS = (
+    ("[Title/Abstract]", "[tiab]"),
+    ("[MeSH Major Topic]", "[majr]"),
+    ("[MeSH Terms]", "[mh]"),
+    ("[Publication Type]", "[pt]"),
+    ("[Date - Publication]", "[dp]"),
+    ("[Article Identifier]", "[aid]"),
+    ("[First Author Name]", "[1au]"),
+    ("[Last Author Name]", "[lastau]"),
+    ("[Affiliation]", "[ad]"),
+    ("[Author]", "[au]"),
+    ("[Journal]", "[ta]"),
+    ("[Language]", "[la]"),
+    ("[Title]", "[ti]"),
+    ("[Text Word]", "[tw]"),
+    ("[Other Term]", "[ot]"),
+)
+
+
+def encoded_query_length(query: str) -> int:
+    """Return the byte length of the query after form/URL encoding."""
+
+    return len(quote_plus(query, safe="").encode("ascii"))
+
+
+def compact_pubmed_query(query: str) -> str:
+    """Shorten standard PubMed field names without changing query semantics."""
+
+    compacted = normalize_space(query)
+    for long_tag, short_tag in PUBMED_FIELD_COMPACTIONS:
+        compacted = re.sub(
+            re.escape(long_tag),
+            short_tag,
+            compacted,
+            flags=re.IGNORECASE,
+        )
+    return compacted
+
+
+def parenthesized_query_spans(query: str) -> list[tuple[int, int]]:
+    """Return content spans for balanced parentheses outside quotes/field tags."""
+
+    stack: list[int] = []
+    spans: list[tuple[int, int]] = [(0, len(query))]
+    quoted = False
+    bracket_depth = 0
+    escaped = False
+    for index, character in enumerate(query):
+        if quoted:
+            if character == '"' and not escaped:
+                quoted = False
+            escaped = character == "\\" and not escaped
+            if character != "\\":
+                escaped = False
+            continue
+        if character == '"':
+            quoted = True
+            escaped = False
+            continue
+        if character == "[":
+            bracket_depth += 1
+            continue
+        if character == "]" and bracket_depth:
+            bracket_depth -= 1
+            continue
+        if bracket_depth:
+            continue
+        if character == "(":
+            stack.append(index)
+        elif character == ")" and stack:
+            start = stack.pop()
+            spans.append((start + 1, index))
+    return spans
+
+
+def top_level_or_positions(query: str, start: int, end: int) -> list[int]:
+    """Locate OR operators at the top level of one expression span."""
+
+    positions: list[int] = []
+    depth = 0
+    bracket_depth = 0
+    quoted = False
+    escaped = False
+    index = start
+    while index < end:
+        character = query[index]
+        if quoted:
+            if character == '"' and not escaped:
+                quoted = False
+            escaped = character == "\\" and not escaped
+            if character != "\\":
+                escaped = False
+            index += 1
+            continue
+        if character == '"':
+            quoted = True
+            escaped = False
+            index += 1
+            continue
+        if character == "[":
+            bracket_depth += 1
+            index += 1
+            continue
+        if character == "]" and bracket_depth:
+            bracket_depth -= 1
+            index += 1
+            continue
+        if bracket_depth:
+            index += 1
+            continue
+        if character == "(":
+            depth += 1
+            index += 1
+            continue
+        if character == ")" and depth:
+            depth -= 1
+            index += 1
+            continue
+        if depth == 0 and query[index : index + 2].casefold() == "or":
+            before = query[index - 1] if index > start else " "
+            after = query[index + 2] if index + 2 < end else " "
+            if not (before.isalnum() or before == "_") and not (
+                after.isalnum() or after == "_"
+            ):
+                positions.append(index)
+                index += 2
+                continue
+        index += 1
+    return positions
+
+
+def remove_low_priority_or_alternative(query: str) -> str | None:
+    """Drop one trailing OR alternative while preserving balanced syntax."""
+
+    candidates: list[tuple[bool, int, int]] = []
+    for start, end in parenthesized_query_spans(query):
+        positions = top_level_or_positions(query, start, end)
+        if not positions:
+            continue
+        last_or = positions[-1]
+        prefix_start = max(0, start - 12)
+        prefix = query[prefix_start : max(0, start - 1)]
+        negated_group = bool(re.search(r"\bNOT\s*$", prefix, re.IGNORECASE))
+        candidates.append((negated_group, end - last_or, last_or))
+    if not candidates:
+        return None
+
+    _, _, last_or = max(candidates, key=lambda item: (item[0], item[1]))
+    containing_ends = [
+        end
+        for start, end in parenthesized_query_spans(query)
+        if start <= last_or < end
+        and last_or in top_level_or_positions(query, start, end)
+    ]
+    if not containing_ends:
+        return None
+    end = min(containing_ends)
+    return normalize_space(query[:last_or].rstrip() + query[end:])
+
+
+def fit_pubmed_query(query: str, max_encoded_length: int) -> QueryBudgetResult:
+    """Fit a query to a conservative encoded-size budget without cutting tokens."""
+
+    original = normalize_space(query)
+    original_length = encoded_query_length(original)
+    if original_length <= max_encoded_length:
+        return QueryBudgetResult(
+            query=original,
+            original_encoded_length=original_length,
+            encoded_length=original_length,
+        )
+
+    fitted = compact_pubmed_query(original)
+    compacted = fitted != original
+    removed = 0
+    while encoded_query_length(fitted) > max_encoded_length:
+        shorter = remove_low_priority_or_alternative(fitted)
+        if shorter is None or shorter == fitted:
+            raise PubMedleyError(
+                "compiled PubMed query is "
+                f"{encoded_query_length(fitted):,} encoded bytes, above "
+                f"--max-query-length={max_encoded_length:,}, and contains no "
+                "complete OR alternative that can be removed safely; shorten "
+                "the input query or raise --max-query-length"
+            )
+        fitted = shorter
+        removed += 1
+
+    return QueryBudgetResult(
+        query=fitted,
+        original_encoded_length=original_length,
+        encoded_length=encoded_query_length(fitted),
+        compacted=compacted,
+        removed_alternatives=removed,
+    )
+
+
+def print_query_budget_warning(
+    fit: QueryBudgetResult,
+    max_encoded_length: int,
+    *,
+    context: str,
+) -> None:
+    if not fit.modified:
+        return
+    actions: list[str] = []
+    if fit.compacted:
+        actions.append("replaced verbose PubMed field names with aliases")
+    if fit.removed_alternatives:
+        actions.append(f"removed {fit.removed_alternatives} trailing OR alternative(s)")
+    print(
+        f"WARNING: {context} was {fit.original_encoded_length:,} encoded bytes, "
+        f"above --max-query-length={max_encoded_length:,}; "
+        + " and ".join(actions)
+        + f". Final query is {fit.encoded_length:,} encoded bytes.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def synchronize_derived_screening_with_query(
+    plan: QueryPlan,
+    effective_query: str,
+) -> None:
+    """Keep automatic LLM criteria aligned with a truncated query."""
+
+    if not plan.screening_is_query_derived:
+        return
+    plan.screening_instructions = append_prompt_filters(
+        generic_screening_instructions(
+            f"Effective compiled PubMed expression: {effective_query}"
+        ),
+        plan.prompt_filters,
+    )
+
+
+def exclusions_within_query_budget(
+    plan: QueryPlan,
+    *,
+    max_age: int,
+    active_exclusions: Sequence[str],
+    suggestions: Sequence[str],
+    max_encoded_length: int,
+) -> tuple[list[str], list[str]]:
+    """Accept impactful suggestions until the next would exceed the budget."""
+
+    accepted: list[str] = []
+    for index, suggestion in enumerate(suggestions):
+        candidate_exclusions = [
+            *active_exclusions,
+            *accepted,
+            suggestion,
+        ]
+        candidate_query = build_query_for_plan(
+            plan,
+            max_age,
+            candidate_exclusions,
+        )
+        compacted_length = encoded_query_length(compact_pubmed_query(candidate_query))
+        if compacted_length > max_encoded_length:
+            return accepted, list(suggestions[index:])
+        accepted.append(suggestion)
+    return accepted, []
+
+
+def search_pubmed(client: HttpClient, query: str, limit: int) -> tuple[list[str], int]:
+    params = {
+        "db": "pubmed",
+        "term": query,
+        "retmode": "json",
+        "retmax": str(limit),
+        "sort": "relevance",
+        **client.ncbi_params(),
+    }
+    response = client.request(
+        "POST",
+        f"{EUTILS_BASE_URL}/esearch.fcgi",
+        data=params,
+    )
+    try:
+        payload = response.json()
+    except (ValueError, requests.JSONDecodeError) as exc:
+        raise PubMedleyError(f"PubMed returned invalid search JSON: {exc}") from exc
+    finally:
+        response.close()
+
+    result = payload.get("esearchresult", {})
+    error = result.get("ERROR") or payload.get("error")
+    if error:
+        raise PubMedleyError(f"PubMed rejected the search: {error}")
+    ids = [str(value) for value in result.get("idlist", [])]
+    try:
+        total = int(result.get("count", len(ids)))
+    except (TypeError, ValueError):
+        total = len(ids)
+    return ids, total
+
+
+def chunked(values: Sequence[str], size: int) -> Iterator[Sequence[str]]:
+    for offset in range(0, len(values), size):
+        yield values[offset : offset + size]
+
+
+def fetch_pubmed_articles(client: HttpClient, pmids: Sequence[str]) -> list[Article]:
+    by_pmid: dict[str, Article] = {}
+    ranks = {pmid: rank for rank, pmid in enumerate(pmids, start=1)}
+
+    batches = list(chunked(pmids, EFETCH_BATCH_SIZE))
+    for batch in tqdm(
+        batches,
+        desc="Fetching PubMed metadata",
+        unit="batch",
+        file=sys.stdout,
+        disable=len(batches) <= 1,
+    ):
+        params = {
+            "db": "pubmed",
+            "id": ",".join(batch),
+            "retmode": "xml",
+            **client.ncbi_params(),
+        }
+        response = client.request(
+            "GET",
+            f"{EUTILS_BASE_URL}/efetch.fcgi",
+            params=params,
+        )
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as exc:
+            raise PubMedleyError(
+                f"PubMed returned invalid metadata XML: {exc}"
+            ) from exc
+        finally:
+            response.close()
+
+        for element in root.findall("./PubmedArticle"):
+            parsed = parse_pubmed_article(element, ranks)
+            by_pmid[parsed.pmid] = parsed
+
+    return [by_pmid[pmid] for pmid in pmids if pmid in by_pmid]
+
+
+def parse_pubmed_article(record: ET.Element, ranks: dict[str, int]) -> Article:
+    citation = record.find("./MedlineCitation")
+    article = record.find("./MedlineCitation/Article")
+    if citation is None or article is None:
+        raise PubMedleyError("A PubMed record was missing MedlineCitation/Article")
+
+    pmid = element_text(citation.find("./PMID"))
+    if not pmid:
+        raise PubMedleyError("A PubMed record was missing its PMID")
+
+    identifiers: dict[str, str] = {}
+    for identifier in record.findall("./PubmedData/ArticleIdList/ArticleId"):
+        kind = (identifier.attrib.get("IdType") or "").casefold()
+        value = element_text(identifier)
+        if kind and value:
+            identifiers[kind] = value
+    identifiers.setdefault("pubmed", pmid)
+
+    abstract_parts: list[str] = []
+    for part in article.findall("./Abstract/AbstractText"):
+        text = element_text(part)
+        if not text:
+            continue
+        label = normalize_space(part.attrib.get("Label", ""))
+        abstract_parts.append(f"{label}: {text}" if label else text)
+
+    authors: list[dict[str, str]] = []
+    for author in article.findall("./AuthorList/Author"):
+        collective = element_text(author.find("./CollectiveName"))
+        author_data = {
+            "last_name": element_text(author.find("./LastName")),
+            "fore_name": element_text(author.find("./ForeName")),
+            "initials": element_text(author.find("./Initials")),
+            "collective_name": collective,
+        }
+        for identifier in author.findall("./Identifier"):
+            if (identifier.attrib.get("Source") or "").casefold() == "orcid":
+                author_data["orcid"] = element_text(identifier)
+        if any(author_data.values()):
+            authors.append(author_data)
+
+    grants: list[dict[str, str]] = []
+    for grant in article.findall("./GrantList/Grant"):
+        grant_data = {
+            "grant_id": element_text(grant.find("./GrantID")),
+            "agency": element_text(grant.find("./Agency")),
+            "country": element_text(grant.find("./Country")),
+        }
+        if any(grant_data.values()):
+            grants.append(grant_data)
+
+    pub_date_element = article.find("./Journal/JournalIssue/PubDate")
+    article_date_element = article.find("./ArticleDate")
+    publication_date, publication_year = parse_publication_date(
+        article_date_element if article_date_element is not None else pub_date_element
+    )
+
+    return Article(
+        search_rank=ranks.get(pmid, 0),
+        pmid=pmid,
+        title=element_text(article.find("./ArticleTitle")) or f"PubMed {pmid}",
+        abstract="\n".join(abstract_parts),
+        journal=element_text(article.find("./Journal/Title")),
+        journal_abbreviation=element_text(
+            citation.find("./MedlineJournalInfo/MedlineTA")
+        ),
+        publication_date=publication_date,
+        publication_year=publication_year,
+        publication_types=unique_text(
+            article.findall("./PublicationTypeList/PublicationType")
+        ),
+        authors=authors,
+        language=unique_text(article.findall("./Language")),
+        pagination=(element_text(article.find("./Pagination/MedlinePgn")) or None),
+        volume=(element_text(article.find("./Journal/JournalIssue/Volume")) or None),
+        issue=(element_text(article.find("./Journal/JournalIssue/Issue")) or None),
+        identifiers=identifiers,
+        keywords=unique_text(citation.findall("./KeywordList/Keyword")),
+        mesh_terms=unique_text(
+            citation.findall("./MeshHeadingList/MeshHeading/DescriptorName")
+        ),
+        grants=grants,
+    )
+
+
+def parse_publication_date(
+    element: ET.Element | None,
+) -> tuple[str | None, int | None]:
+    if element is None:
+        return None, None
+    year_text = element_text(element.find("./Year"))
+    medline_date = element_text(element.find("./MedlineDate"))
+    source = year_text or medline_date
+    match = re.search(r"\b(19|20)\d{2}\b", source)
+    if not match:
+        return source or None, None
+    year = int(match.group(0))
+
+    month_text = element_text(element.find("./Month"))
+    day_text = element_text(element.find("./Day"))
+    if not year_text:
+        return medline_date, year
+    if not month_text:
+        return f"{year:04d}", year
+    try:
+        month = int(month_text)
+    except ValueError:
+        month = MONTHS.get(month_text[:3].casefold(), 0)
+    if not 1 <= month <= 12:
+        return f"{year:04d}", year
+    if not day_text:
+        return f"{year:04d}-{month:02d}", year
+    try:
+        day = int(day_text)
+        parsed = date(year, month, day)
+    except ValueError:
+        return f"{year:04d}-{month:02d}", year
+    return parsed.isoformat(), year
+
+
+def pagination_page_count(pagination: str | None) -> int | None:
+    """Estimate article pages from MEDLINE pagination when it is unambiguous."""
+
+    if not pagination:
+        return None
+    match = re.fullmatch(
+        r"\s*([A-Za-z]*)(\d+)\s*[-–—]\s*([A-Za-z]*)(\d+)\s*",
+        pagination,
+    )
+    if not match:
+        return None
+
+    start_prefix, start_text, end_prefix, end_text = match.groups()
+    if start_prefix and end_prefix and start_prefix.casefold() != end_prefix.casefold():
+        return None
+
+    start = int(start_text)
+    end = int(end_text)
+    if len(end_text) < len(start_text):
+        modulus = 10 ** len(end_text)
+        end = start - (start % modulus) + end
+        if end < start:
+            end += modulus
+    if end < start:
+        return None
+
+    count = end - start + 1
+    return count if 1 <= count <= 10_000 else None
+
+
+def assess_relevance(
+    article: Article, additional_exclusions: Sequence[str]
+) -> Relevance:
+    title = article.title.casefold()
+    exclusions = (*BUILTIN_TITLE_EXCLUSIONS, *additional_exclusions)
+    matched_exclusions = [term for term in exclusions if contains_term(title, term)]
+    if matched_exclusions:
+        return Relevance(
+            eligible=False,
+            score=0,
+            reason=(
+                "title matched excluded term(s): "
+                + ", ".join(sorted(set(matched_exclusions)))
+            ),
+        )
+
+    searchable = " ".join(
+        (
+            title,
+            article.abstract.casefold(),
+            " ".join(article.mesh_terms).casefold(),
+            " ".join(article.keywords).casefold(),
+        )
+    )
+    topic_matches = matching_terms(searchable, TOPIC_TERMS)
+    theory_matches = matching_terms(searchable, THEORY_TERMS)
+    publication_type_text = " ".join(article.publication_types).casefold()
+    review_matches = matching_terms(
+        f"{searchable} {publication_type_text}", REVIEW_TERMS
+    )
+    human_intelligence_matches = matching_terms(
+        searchable, HUMAN_INTELLIGENCE_EVIDENCE_TERMS
+    )
+
+    score = int(bool(topic_matches)) + int(bool(theory_matches))
+    score += int(bool(review_matches))
+    score += int("human intelligence" in searchable)
+    score += int(
+        any(kind in publication_type_text for kind in ("review", "meta-analysis"))
+    )
+    missing: list[str] = []
+    if "intelligence" not in title:
+        missing.append("'intelligence' in the title")
+    if not human_intelligence_matches:
+        missing.append("human-intelligence topic evidence")
+    if not any(contains_term(title, term) for term in COMPREHENSIVE_TITLE_TERMS):
+        missing.append("broad theory/model/review evidence in the title")
+    if not theory_matches:
+        missing.append("theory/model evidence")
+    if not review_matches:
+        missing.append("review evidence")
+
+    return Relevance(
+        eligible=not missing,
+        score=score,
+        matched_topic_terms=topic_matches,
+        matched_theory_terms=theory_matches,
+        matched_review_terms=review_matches,
+        reason=("missing " + ", ".join(missing)) if missing else None,
+    )
+
+
+def matching_terms(text: str, terms: Iterable[str]) -> list[str]:
+    return [term for term in terms if term in text]
+
+
+def contains_term(text: str, term: str) -> bool:
+    """Match an exclusion on word boundaries, tolerating phrase separators."""
+
+    words = [re.escape(word) for word in normalize_space(term).split()]
+    if not words:
+        return False
+    pattern = r"(?<!\w)" + r"[\s\-_–—/]+".join(words) + r"(?!\w)"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+
+def screening_provider_name(args: argparse.Namespace) -> str:
+    return "openai" if args.openai_model else "gemini"
+
+
+def screening_model_name(args: argparse.Namespace) -> str:
+    return args.openai_model or args.gemini_model
+
+
+def screening_provider_label(provider: str) -> str:
+    return "OpenAI" if provider == "openai" else "Gemini"
+
+
+def fail_open_screening_selection(
+    articles: Sequence[Article],
+    *,
+    model: str,
+    error: str,
+    provider: str,
+) -> GeminiSelection:
+    """Approve everything when the configured LLM cannot be used."""
+
+    label = screening_provider_label(provider)
+    return GeminiSelection(
+        approved_pmids={article.pmid for article in articles},
+        decisions={
+            article.pmid: {
+                "decision": "approved",
+                "reason": f"{label} fail-open: {error}",
+            }
+            for article in articles
+        },
+        suggested_exclusions=[],
+        used=False,
+        fallback=True,
+        model=model,
+        error=error,
+        provider=provider,
+    )
+
+
+def fail_open_gemini_selection(
+    articles: Sequence[Article],
+    *,
+    model: str,
+    error: str,
+) -> GeminiSelection:
+    """Backward-compatible Gemini-specific fail-open helper."""
+
+    return fail_open_screening_selection(
+        articles,
+        model=model,
+        error=error,
+        provider="gemini",
+    )
+
+
+DEFAULT_INTELLIGENCE_SCREENING_INSTRUCTIONS = """
+Screen for a research corpus about THEORIES OF GENERAL HUMAN INTELLIGENCE.
+
+Approve an article only when its main purpose is to develop, compare, integrate,
+or comprehensively review broad theories/models/process accounts of human
+intelligence or general intelligence. Neural or cognitive process theories of
+general intelligence are in scope.
+
+Strong positive examples:
+- "Network Neuroscience Theory of Human Intelligence"
+- "Thinking as Analogy-Making: Toward a Neural Process Account of General
+  Intelligence"
+
+Reject articles whose main purpose is any of the following:
+- artificial, machine, hybrid, swarm, robotic, or emotional intelligence;
+- spiritual, cultural, moral, business, clinical, or other narrow intelligence
+  constructs;
+- disease-specific assessment, premorbid IQ estimation, test validation, or
+  clinical instrumentation;
+- animal intelligence;
+- a narrow correlate of intelligence (religiosity, one gene, one brain region,
+  imaging association, dopamine, working memory, or executive function) without
+  synthesizing a broad theory of intelligence;
+- an empirical prediction/benchmark paper that does not substantially review or
+  propose a general theory;
+- corrections, editorials, protocols, or short commentary.
+""".strip()
+
+
+def gemini_screening_prompt(
+    articles: Sequence[Article],
+    *,
+    screening_instructions: str | None = None,
+) -> str:
+    """Build a high-precision screening prompt with enough abstract context."""
+
+    records = [
+        {
+            "pmid": article.pmid,
+            "search_rank": article.search_rank,
+            "title": article.title,
+            "journal": article.journal,
+            "publication_year": article.publication_year,
+            "publication_types": article.publication_types,
+            "abstract": truncate(article.abstract, 2_500),
+        }
+        for article in articles
+    ]
+    criteria = screening_instructions or DEFAULT_INTELLIGENCE_SCREENING_INSTRUCTIONS
+    return f"""
+You are screening PubMed records.
+
+Screening instructions:
+{criteria}
+
+Do not infer the PDF page count; the downloader checks that separately. Return a
+decision for every PMID. Also suggest short title phrases that would safely
+exclude recurring false-positive topics in a future PubMed query. Return no more
+than {GEMINI_MAX_SUGGESTED_EXCLUSIONS} suggestions, ranked by the number of
+rejected titles they would exclude. Each phrase must occur verbatim in at least
+{MIN_AUTOMATIC_EXCLUSION_TITLE_MATCHES} rejected titles, must occur in no
+approved title, and must not exclude genuine articles matching the screening
+objective. Return an empty list rather than one-off or weak suggestions.
+
+Candidate records:
+""" + json.dumps(records, ensure_ascii=False)
+
+
+def screening_response_schema() -> dict[str, Any]:
+    """Return a strict-schema-compatible response shape for both providers."""
+
+    decision_row = {
+        "type": "object",
+        "properties": {
+            "pmid": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["pmid", "reason"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "approved": {
+                "type": "array",
+                "items": decision_row,
+            },
+            "rejected": {
+                "type": "array",
+                "items": decision_row,
+            },
+            "suggested_exclusions": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["approved", "rejected", "suggested_exclusions"],
+        "additionalProperties": False,
+    }
+
+
+def validate_gemini_payload(
+    payload: Any,
+    articles: Sequence[Article],
+    *,
+    model: str,
+    provider: str = "gemini",
+) -> GeminiSelection:
+    """Validate LLM IDs strictly so a malformed response triggers fail-open."""
+
+    label = screening_provider_label(provider)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} response was not a JSON object")
+    expected = {article.pmid for article in articles}
+    decisions: dict[str, dict[str, str]] = {}
+    approved_pmids: set[str] = set()
+
+    for decision_name in ("approved", "rejected"):
+        rows = payload.get(decision_name)
+        if not isinstance(rows, list):
+            raise ValueError(
+                f"{label} response omitted the {decision_name!r} list"
+            )
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"{label} {decision_name} entry was not an object"
+                )
+            pmid = str(row.get("pmid", "")).strip()
+            reason = normalize_space(str(row.get("reason", "")))
+            if pmid not in expected:
+                raise ValueError(f"{label} returned unknown PMID {pmid!r}")
+            if pmid in decisions:
+                raise ValueError(
+                    f"{label} returned PMID {pmid} more than once"
+                )
+            decision = "approved" if decision_name == "approved" else "rejected"
+            decisions[pmid] = {
+                "decision": decision,
+                "reason": reason or "No reason supplied",
+            }
+            if decision == "approved":
+                approved_pmids.add(pmid)
+
+    omitted = expected - decisions.keys()
+    for pmid in omitted:
+        decisions[pmid] = {
+            "decision": "approved",
+            "reason": f"{label} omitted this PMID; individual fail-open approval",
+        }
+        approved_pmids.add(pmid)
+
+    suggestions_value = payload.get("suggested_exclusions", [])
+    if not isinstance(suggestions_value, list):
+        raise ValueError(f"{label} suggested_exclusions was not a list")
+    suggestions = list(
+        dict.fromkeys(
+            normalize_space(str(value)).casefold()
+            for value in suggestions_value
+            if normalize_space(str(value))
+        )
+    )[:GEMINI_MAX_SUGGESTED_EXCLUSIONS]
+    return GeminiSelection(
+        approved_pmids=approved_pmids,
+        decisions=decisions,
+        suggested_exclusions=suggestions,
+        used=True,
+        fallback=bool(omitted),
+        model=model,
+        error=(
+            f"{label} omitted PMID(s): "
+            + ", ".join(sorted(omitted, key=int))
+            if omitted
+            else None
+        ),
+        provider=provider,
+    )
+
+
+def screen_articles_with_gemini(
+    articles: Sequence[Article],
+    *,
+    auth_path: Path,
+    model: str,
+    location: str,
+    retries: int,
+    screening_instructions: str | None = None,
+) -> GeminiSelection:
+    """Screen candidates with Gemini/Vertex AI and fail open on any problem."""
+
+    if not articles:
+        return GeminiSelection(
+            set(),
+            {},
+            [],
+            False,
+            False,
+            model,
+            provider="gemini",
+        )
+    if not auth_path.is_file():
+        error = f"credential file not found: {auth_path}"
+        print(f"WARNING: Gemini screening skipped: {error}", file=sys.stderr)
+        return fail_open_gemini_selection(articles, model=model, error=error)
+
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+        from google.oauth2 import service_account
+    except (ImportError, ModuleNotFoundError) as exc:
+        error = (
+            f"missing Gemini dependency {getattr(exc, 'name', None) or exc}; "
+            "install sources/requirements.txt"
+        )
+        print(f"WARNING: Gemini screening skipped: {error}", file=sys.stderr)
+        return fail_open_gemini_selection(articles, model=model, error=error)
+
+    schema = screening_response_schema()
+    client: Any = None
+    errors: list[str] = []
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            str(auth_path),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        project = getattr(credentials, "project_id", None)
+        if not project:
+            raise ValueError("service-account JSON has no project_id")
+        client = genai.Client(
+            vertexai=True,
+            credentials=credentials,
+            project=project,
+            location=location,
+            http_options=genai_types.HttpOptions(api_version="v1"),
+        )
+        prompt = gemini_screening_prompt(
+            articles,
+            screening_instructions=screening_instructions,
+        )
+        for attempt in range(1, retries + 2):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_json_schema": schema,
+                        "max_output_tokens": 16_384,
+                    },
+                )
+                response_text = getattr(response, "text", None)
+                if not response_text:
+                    raise ValueError("Gemini returned no response text")
+                payload = json.loads(response_text)
+                return validate_gemini_payload(payload, articles, model=model)
+            except Exception as exc:
+                errors.append(compact_error(exc))
+                if attempt >= retries + 1:
+                    break
+                delay = min(2 ** (attempt - 1), 30)
+                print(
+                    f"WARNING: Gemini attempt {attempt} failed; retrying in "
+                    f"{delay}s: {errors[-1]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+    except Exception as exc:
+        errors.append(compact_error(exc))
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    error = "; ".join(errors) or "unknown Gemini failure"
+    print(
+        f"WARNING: Gemini screening failed; approving all candidates: {error}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return fail_open_gemini_selection(articles, model=model, error=error)
+
+
+def screen_articles_with_openai(
+    articles: Sequence[Article],
+    *,
+    model: str,
+    retries: int,
+    screening_instructions: str | None = None,
+) -> GeminiSelection:
+    """Screen with OpenAI Structured Outputs and fail open on any problem."""
+
+    if not articles:
+        return GeminiSelection(
+            set(),
+            {},
+            [],
+            False,
+            False,
+            model,
+            provider="openai",
+        )
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        error = "OPENAI_API_KEY is not set"
+        print(f"WARNING: OpenAI screening skipped: {error}", file=sys.stderr)
+        return fail_open_screening_selection(
+            articles,
+            model=model,
+            error=error,
+            provider="openai",
+        )
+
+    try:
+        from openai import OpenAI
+    except (ImportError, ModuleNotFoundError) as exc:
+        error = (
+            f"missing OpenAI dependency {getattr(exc, 'name', None) or exc}; "
+            "install sources/requirements.txt"
+        )
+        print(f"WARNING: OpenAI screening skipped: {error}", file=sys.stderr)
+        return fail_open_screening_selection(
+            articles,
+            model=model,
+            error=error,
+            provider="openai",
+        )
+
+    client: Any = None
+    errors: list[str] = []
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            max_retries=0,
+        )
+        prompt = gemini_screening_prompt(
+            articles,
+            screening_instructions=screening_instructions,
+        )
+        for attempt in range(1, retries + 2):
+            try:
+                response = client.responses.create(
+                    model=model,
+                    input=prompt,
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": "pubmed_relevance_screening",
+                            "description": (
+                                "Relevance decisions and reusable title "
+                                "exclusions for PubMed candidates"
+                            ),
+                            "schema": screening_response_schema(),
+                            "strict": True,
+                        }
+                    },
+                    max_output_tokens=16_384,
+                )
+                response_text = getattr(response, "output_text", None)
+                if not response_text:
+                    raise ValueError(
+                        "OpenAI returned no structured response text"
+                    )
+                payload = json.loads(response_text)
+                return validate_gemini_payload(
+                    payload,
+                    articles,
+                    model=model,
+                    provider="openai",
+                )
+            except Exception as exc:
+                errors.append(compact_error(exc))
+                if attempt >= retries + 1:
+                    break
+                delay = min(2 ** (attempt - 1), 30)
+                print(
+                    f"WARNING: OpenAI attempt {attempt} failed; retrying in "
+                    f"{delay}s: {errors[-1]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+    except Exception as exc:
+        errors.append(compact_error(exc))
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    error = "; ".join(errors) or "unknown OpenAI failure"
+    print(
+        f"WARNING: OpenAI screening failed; approving all candidates: {error}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return fail_open_screening_selection(
+        articles,
+        model=model,
+        error=error,
+        provider="openai",
+    )
+
+
+def screen_articles_with_gemini_in_batches(
+    articles: Sequence[Article],
+    *,
+    auth_path: Path,
+    model: str,
+    location: str,
+    retries: int,
+    screening_instructions: str | None = None,
+) -> GeminiSelection:
+    """Screen a large relevance-ordered candidate set in bounded prompts."""
+
+    if not articles:
+        return GeminiSelection(
+            set(),
+            {},
+            [],
+            False,
+            False,
+            model,
+            provider="gemini",
+        )
+
+    approved_pmids: set[str] = set()
+    decisions: dict[str, dict[str, str]] = {}
+    suggested_exclusions: list[str] = []
+    used = False
+    fallback = False
+    errors: list[str] = []
+    batches = list(chunked(articles, GEMINI_BATCH_SIZE))
+
+    for batch_number, batch in enumerate(batches, start=1):
+        print(
+            f"Gemini screening batch {batch_number}/{len(batches)} "
+            f"({len(batch)} candidate(s))...",
+            flush=True,
+        )
+        selection = screen_articles_with_gemini(
+            batch,
+            auth_path=auth_path,
+            model=model,
+            location=location,
+            retries=retries,
+            screening_instructions=screening_instructions,
+        )
+        approved_pmids.update(selection.approved_pmids)
+        decisions.update(selection.decisions)
+        suggested_exclusions.extend(selection.suggested_exclusions)
+        used = used or selection.used
+        fallback = fallback or selection.fallback
+        if selection.error:
+            errors.append(selection.error)
+
+        if selection.fallback and not selection.used and batch_number < len(batches):
+            remaining = [
+                article
+                for later_batch in batches[batch_number:]
+                for article in later_batch
+            ]
+            remaining_selection = fail_open_gemini_selection(
+                remaining,
+                model=model,
+                error=selection.error or "earlier Gemini batch failed",
+            )
+            approved_pmids.update(remaining_selection.approved_pmids)
+            decisions.update(remaining_selection.decisions)
+            break
+
+    return GeminiSelection(
+        approved_pmids=approved_pmids,
+        decisions=decisions,
+        suggested_exclusions=list(dict.fromkeys(suggested_exclusions))[:25],
+        used=used,
+        fallback=fallback,
+        model=model,
+        error="; ".join(dict.fromkeys(errors)) or None,
+        provider="gemini",
+    )
+
+
+def screen_articles_with_openai_in_batches(
+    articles: Sequence[Article],
+    *,
+    model: str,
+    retries: int,
+    screening_instructions: str | None = None,
+) -> GeminiSelection:
+    """Screen a relevance-ordered candidate set using bounded OpenAI calls."""
+
+    if not articles:
+        return GeminiSelection(
+            set(),
+            {},
+            [],
+            False,
+            False,
+            model,
+            provider="openai",
+        )
+
+    selections: list[GeminiSelection] = []
+    batches = list(chunked(articles, GEMINI_BATCH_SIZE))
+    for batch_number, batch in enumerate(batches, start=1):
+        print(
+            f"OpenAI screening batch {batch_number}/{len(batches)} "
+            f"({len(batch)} candidate(s))...",
+            flush=True,
+        )
+        selection = screen_articles_with_openai(
+            batch,
+            model=model,
+            retries=retries,
+            screening_instructions=screening_instructions,
+        )
+        selections.append(selection)
+        if selection.fallback and not selection.used:
+            if batch_number < len(batches):
+                remaining = [
+                    article
+                    for later_batch in batches[batch_number:]
+                    for article in later_batch
+                ]
+                selections.append(
+                    fail_open_screening_selection(
+                        remaining,
+                        model=model,
+                        error=selection.error
+                        or "an earlier OpenAI batch failed",
+                        provider="openai",
+                    )
+                )
+            break
+
+    return merge_gemini_selections(
+        selections,
+        model=model,
+        provider="openai",
+    )
+
+
+def merge_gemini_selections(
+    selections: Sequence[GeminiSelection],
+    *,
+    model: str,
+    provider: str = "gemini",
+) -> GeminiSelection:
+    approved_pmids: set[str] = set()
+    decisions: dict[str, dict[str, str]] = {}
+    suggestions: list[str] = []
+    errors: list[str] = []
+    for selection in selections:
+        approved_pmids.update(selection.approved_pmids)
+        decisions.update(selection.decisions)
+        suggestions.extend(selection.suggested_exclusions)
+        if selection.error:
+            errors.append(selection.error)
+    return GeminiSelection(
+        approved_pmids=approved_pmids,
+        decisions=decisions,
+        suggested_exclusions=list(dict.fromkeys(suggestions))[:25],
+        used=any(selection.used for selection in selections),
+        fallback=any(selection.fallback for selection in selections),
+        model=model,
+        error="; ".join(dict.fromkeys(errors)) or None,
+        provider=provider,
+    )
+
+
+def safe_automatic_exclusions(
+    selection: GeminiSelection,
+    articles: Sequence[Article],
+    already_active: Sequence[str],
+    *,
+    implicit_exclusions: Sequence[str] = BUILTIN_TITLE_EXCLUSIONS,
+) -> list[str]:
+    """Rank safe recurring exclusions by marginal rejected-title coverage."""
+
+    approved = [
+        article
+        for article in articles
+        if selection.decisions.get(article.pmid, {}).get("decision") == "approved"
+    ]
+    rejected = [
+        article
+        for article in articles
+        if selection.decisions.get(article.pmid, {}).get("decision") == "rejected"
+    ]
+    active = {term.casefold() for term in (*implicit_exclusions, *already_active)}
+    candidates: dict[str, set[int]] = {}
+    for suggestion in selection.suggested_exclusions:
+        term = normalize_space(suggestion).casefold()
+        if not term or term in active:
+            continue
+        rejected_matches = {
+            index
+            for index, article in enumerate(rejected)
+            if contains_term(article.title, term)
+        }
+        if len(rejected_matches) < MIN_AUTOMATIC_EXCLUSION_TITLE_MATCHES:
+            continue
+        if any(contains_term(article.title, term) for article in approved):
+            continue
+        candidates[term] = rejected_matches
+
+    selected: list[str] = []
+    covered: set[int] = set()
+    while candidates and len(selected) < MAX_AUTOMATIC_EXCLUSIONS_PER_ROUND:
+        ranked = sorted(
+            candidates.items(),
+            key=lambda item: (
+                -len(item[1] - covered),
+                -len(item[1]),
+                encoded_query_length(item[0]),
+                item[0],
+            ),
+        )
+        term, matches = ranked[0]
+        if not (matches - covered):
+            break
+        selected.append(term)
+        covered.update(matches)
+        del candidates[term]
+    return selected
+
+
+def write_llm_report(
+    path: Path,
+    selection: GeminiSelection,
+    articles: Sequence[Article],
+    *,
+    query_rounds: Sequence[dict[str, Any]] = (),
+    automatically_applied_exclusions: Sequence[str] = (),
+    query_plan: QueryPlan | None = None,
+) -> None:
+    provider_label = screening_provider_label(selection.provider)
+    ordered_decisions = [
+        {
+            "pmid": article.pmid,
+            "search_rank": article.search_rank,
+            "title": article.title,
+            **selection.decisions.get(
+                article.pmid,
+                {
+                    "decision": "unknown",
+                    "reason": f"No {provider_label} decision",
+                },
+            ),
+        }
+        for article in articles
+    ]
+    payload = {
+        "provider": selection.provider,
+        "model": selection.model,
+        "used": selection.used,
+        "fallback": selection.fallback,
+        "error": selection.error,
+        "approved_count": len(selection.approved_pmids),
+        "candidate_count": len(articles),
+        "built_in_title_exclusions": (
+            list(BUILTIN_TITLE_EXCLUSIONS)
+            if query_plan is None
+            or query_plan.mode == "default"
+            or (
+                query_plan.mode == "yaml"
+                and query_plan.yaml_document is not None
+                and query_plan.yaml_document.get("use_default_exclusions", False)
+            )
+            else []
+        ),
+        "suggested_exclusions": selection.suggested_exclusions,
+        "suggested_exclude_argument": ",".join(selection.suggested_exclusions),
+        "automatically_applied_exclusions": list(automatically_applied_exclusions),
+        "query_rounds": list(query_rounds),
+        "query_mode": query_plan.mode if query_plan else None,
+        "query_source": query_plan.source if query_plan else None,
+        "screening_instructions": (
+            query_plan.screening_instructions if query_plan else None
+        ),
+        "suggested_exclusion_title_counts": {
+            term: sum(
+                contains_term(article.title, term)
+                for article in articles
+                if selection.decisions.get(article.pmid, {}).get("decision")
+                == "rejected"
+            )
+            for term in selection.suggested_exclusions
+        },
+        "decisions": ordered_decisions,
+    }
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def discover_pdf_candidates(
+    client: HttpClient, article: Article
+) -> tuple[list[PdfCandidate], dict[str, Any], list[str]]:
+    candidates: list[PdfCandidate] = []
+    discovery_metadata: dict[str, Any] = {}
+    errors: list[str] = []
+
+    if article.pmcid:
+        try:
+            aws_candidates, aws_metadata = discover_pmc_aws_links(
+                client,
+                article.pmcid,
+            )
+            candidates.extend(aws_candidates)
+            discovery_metadata["pmc_aws_open_data"] = aws_metadata
+        except PubMedleyError as exc:
+            errors.append(f"PMC AWS lookup: {compact_error(exc)}")
+
+        try:
+            oa_candidates, oa_metadata = discover_pmc_oa_links(client, article.pmcid)
+            candidates.extend(oa_candidates)
+            discovery_metadata["pmc_open_access"] = oa_metadata
+        except PubMedleyError as exc:
+            errors.append(f"PMC OA lookup: {compact_error(exc)}")
+
+        try:
+            candidates.extend(
+                discover_links_from_page(
+                    client,
+                    article.pmc_url or "",
+                    source="PMC article page",
+                )
+            )
+        except PubMedleyError as exc:
+            errors.append(f"PMC page lookup: {compact_error(exc)}")
+
+        candidates.append(
+            PdfCandidate(
+                url=f"{PMC_ARTICLE_BASE_URL}/{article.pmcid}/pdf/",
+                source="PMC canonical PDF endpoint",
+            )
+        )
+
+    if article.doi:
+        doi_url = f"https://doi.org/{quote(article.doi, safe='/():;')}"
+        try:
+            candidates.extend(
+                discover_links_from_page(
+                    client,
+                    doi_url,
+                    source="DOI publisher page",
+                )
+            )
+        except PubMedleyError as exc:
+            errors.append(f"DOI page lookup: {compact_error(exc)}")
+
+    # PubMed can label publisher-only pages as free full text.  Check its page as
+    # a last discovery source when PMC/DOI metadata did not expose a usable link.
+    if not candidates:
+        try:
+            candidates.extend(
+                discover_links_from_page(
+                    client,
+                    article.pubmed_url,
+                    source="PubMed article page",
+                )
+            )
+        except PubMedleyError as exc:
+            errors.append(f"PubMed page lookup: {compact_error(exc)}")
+
+    return deduplicate_candidates(candidates), discovery_metadata, errors
+
+
+def discover_pmc_aws_links(
+    client: HttpClient,
+    pmcid: str,
+) -> tuple[list[PdfCandidate], dict[str, Any]]:
+    """Find versioned PDFs in PMC's current anonymous AWS Open Data layout."""
+
+    match = re.fullmatch(r"(PMC\d+)(?:\.(\d+))?", pmcid.strip().upper())
+    if match is None:
+        raise PubMedleyError(f"invalid PMCID for PMC AWS lookup: {pmcid!r}")
+    base_pmcid, requested_version = match.groups()
+    response = client.request(
+        "GET",
+        PMC_AWS_BASE_URL,
+        params={
+            "list-type": "2",
+            "prefix": f"{base_pmcid}.",
+            "delimiter": "/",
+        },
+    )
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError as exc:
+        raise PubMedleyError(f"invalid PMC AWS XML: {exc}") from exc
+    finally:
+        response.close()
+
+    prefixes = {
+        normalize_space(element_text(element))
+        for element in root.findall(".//{*}CommonPrefixes/{*}Prefix")
+    }
+    versioned: list[tuple[int, str]] = []
+    for prefix in prefixes:
+        version_match = re.fullmatch(
+            rf"{re.escape(base_pmcid)}\.(\d+)/",
+            prefix,
+        )
+        if version_match is None:
+            continue
+        version = int(version_match.group(1))
+        if requested_version is None or version == int(requested_version):
+            versioned.append((version, prefix))
+    versioned.sort(reverse=True)
+
+    candidates = [
+        PdfCandidate(
+            url=(
+                f"{PMC_AWS_BASE_URL}/"
+                f"{quote(prefix + prefix.rstrip('/') + '.pdf', safe='/')}"
+            ),
+            source=f"PMC AWS Open Data (version {version})",
+        )
+        for version, prefix in versioned
+    ]
+    return candidates, {
+        "available": bool(candidates),
+        "pmcid": base_pmcid,
+        "versions": [version for version, _ in versioned],
+    }
+
+
+def discover_pmc_oa_links(
+    client: HttpClient, pmcid: str
+) -> tuple[list[PdfCandidate], dict[str, Any]]:
+    params = {"id": pmcid, **client.ncbi_params()}
+    # OA does not accept api_key, even though the E-utilities do.
+    params.pop("api_key", None)
+    response = client.request("GET", PMC_OA_URL, params=params)
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError as exc:
+        raise PubMedleyError(f"invalid PMC OA XML: {exc}") from exc
+    finally:
+        response.close()
+
+    error = root.find("./error")
+    if error is not None:
+        raise PubMedleyError(element_text(error) or "PMC OA service error")
+    record = root.find("./records/record")
+    if record is None:
+        return [], {"available": False}
+
+    metadata = {
+        "available": True,
+        "license": record.attrib.get("license"),
+        "retracted": record.attrib.get("retracted"),
+        "citation": record.attrib.get("citation"),
+    }
+    candidates: list[PdfCandidate] = []
+    for link in record.findall("./link"):
+        if (link.attrib.get("format") or "").casefold() != "pdf":
+            continue
+        href = link.attrib.get("href", "")
+        if not href:
+            continue
+        for url, source_suffix in expand_pmc_oa_url(href, pmcid):
+            candidates.append(
+                PdfCandidate(
+                    url=url,
+                    source=f"PMC Open Access service{source_suffix}",
+                )
+            )
+    return candidates, metadata
+
+
+def expand_pmc_oa_url(href: str, pmcid: str) -> list[tuple[str, str]]:
+    """Normalize FTP links and cover PMC's 2026 legacy-directory migration."""
+
+    parsed = urlparse(href)
+    if parsed.scheme == "ftp":
+        parsed = parsed._replace(scheme="https")
+    normalized = urlunparse(parsed)
+    expanded: list[tuple[str, str]] = [(normalized, "")]
+
+    path = parsed.path
+    if "/pub/pmc/oa_pdf/" in path:
+        deprecated_path = path.replace(
+            "/pub/pmc/oa_pdf/", "/pub/pmc/deprecated/oa_pdf/", 1
+        )
+        expanded.append(
+            (
+                urlunparse(parsed._replace(path=deprecated_path)),
+                " (2026 deprecated-path fallback)",
+            )
+        )
+
+    filename = Path(path).name
+    if filename:
+        expanded.append(
+            (
+                f"{PMC_ARTICLE_BASE_URL}/{pmcid}/bin/{quote(filename)}",
+                " (PMC bin fallback)",
+            )
+        )
+    return expanded
+
+
+def discover_links_from_page(
+    client: HttpClient, url: str, *, source: str
+) -> list[PdfCandidate]:
+    if not url:
+        return []
+    response = client.request("GET", url, allow_redirects=True, stream=True)
+    try:
+        content_type = response.headers.get("Content-Type", "").casefold()
+        if "application/pdf" in content_type:
+            return [PdfCandidate(response.url, f"{source} direct response")]
+
+        body = read_limited_response(response, MAX_HTML_BYTES)
+        if body.lstrip().startswith(b"%PDF-"):
+            return [PdfCandidate(response.url, f"{source} direct response")]
+        charset = response.encoding or "utf-8"
+        page = body.decode(charset, errors="replace")
+        parser = PdfLinkParser(response.url)
+        parser.feed(page)
+        return [PdfCandidate(link, source) for link in parser.links]
+    finally:
+        response.close()
+
+
+def read_limited_response(response: requests.Response, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        size += len(chunk)
+        if size > limit:
+            raise PubMedleyError(
+                f"response from {response.url} exceeded {limit} bytes"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def deduplicate_candidates(
+    candidates: Iterable[PdfCandidate],
+) -> list[PdfCandidate]:
+    unique: list[PdfCandidate] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        url = normalize_download_url(candidate.url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        unique.append(PdfCandidate(url=url, source=candidate.source))
+    return unique
+
+
+def normalize_download_url(url: str) -> str:
+    parsed = urlparse(html.unescape(url.strip()))
+    if parsed.scheme == "ftp":
+        parsed = parsed._replace(scheme="https")
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    return urlunparse(parsed)
+
+
+def looks_like_pdf_url(url: str) -> bool:
+    path = urlparse(html.unescape(url)).path.casefold().rstrip("/")
+    return (
+        path.endswith(".pdf")
+        or path.endswith("/pdf")
+        or "/pdf/" in path
+        or "/pdfdirect" in path
+    )
+
+
+def body_is_pdf(body: bytes) -> bool:
+    return b"%PDF-" in body[:1_024]
+
+
+def headers_indicate_pdf(headers: dict[str, str]) -> bool:
+    content_type = headers.get("content-type", "").casefold()
+    disposition = headers.get("content-disposition", "").casefold()
+    return "application/pdf" in content_type or ".pdf" in disposition
+
+
+class BrowserPdfDownloader:
+    """Persistent Playwright/Chromium crawler for publisher PDF workflows."""
+
+    def __init__(self, *, timeout: float, retries: int) -> None:
+        self.timeout_ms = max(1, int(timeout * 1_000))
+        self.retries = retries
+        self._playwright: Any = None
+        self._browser: Any = None
+        self._context: Any = None
+
+    def close(self) -> None:
+        for value in (self._context, self._browser):
+            if value is not None:
+                try:
+                    value.close()
+                except Exception:
+                    pass
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+        self._playwright = None
+        self._browser = None
+        self._context = None
+
+    def _ensure_started(self) -> None:
+        if self._context is not None:
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise BrowserDownloadFailed(
+                "Playwright is not installed; install sources/requirements.txt "
+                "and run `python -m playwright install chromium`"
+            ) from exc
+
+        try:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-extensions"],
+            )
+            self._context = self._browser.new_context(
+                accept_downloads=True,
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/138.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 1000},
+                locale="en-US",
+            )
+            self._context.set_default_timeout(self.timeout_ms)
+            self._context.set_default_navigation_timeout(self.timeout_ms)
+        except Exception as exc:
+            self.close()
+            raise BrowserDownloadFailed(
+                "Chromium could not start. Run "
+                "`python -m playwright install chromium`: "
+                f"{compact_error(exc)}"
+            ) from exc
+
+    def download(
+        self,
+        article: Article,
+        destination: Path,
+    ) -> BrowserPdfResult:
+        self._ensure_started()
+        errors: list[str] = []
+        for attempt in range(1, self.retries + 2):
+            destination.unlink(missing_ok=True)
+            try:
+                return self._download_once(article, destination)
+            except BrowserDownloadFailed as exc:
+                errors.append(compact_error(exc))
+                if attempt >= self.retries + 1:
+                    break
+                delay = min(2 ** (attempt - 1), 30)
+                tqdm.write(
+                    f"  browser retry {attempt}/{self.retries} in {delay}s: "
+                    f"{errors[-1]}",
+                    file=sys.stdout,
+                )
+                time.sleep(delay)
+        raise BrowserDownloadFailed(
+            f"browser exhausted {len(errors)} attempt(s): " + "; ".join(errors)
+        )
+
+    def _download_once(
+        self,
+        article: Article,
+        destination: Path,
+    ) -> BrowserPdfResult:
+        page = self._context.new_page()
+        downloads: list[Any] = []
+        pdf_responses: list[Any] = []
+        visited_urls: list[str] = []
+        errors: list[str] = []
+
+        def capture_response(response: Any) -> None:
+            try:
+                headers = {
+                    str(key).casefold(): str(value)
+                    for key, value in response.headers.items()
+                }
+                if headers_indicate_pdf(headers):
+                    pdf_responses.append(response)
+            except Exception:
+                return
+
+        page.on("download", lambda download: downloads.append(download))
+        page.on("response", capture_response)
+        queue: deque[tuple[str, str]] = deque(self._landing_urls(article))
+        queued = {url for url, _ in queue}
+
+        try:
+            while queue and len(visited_urls) < BROWSER_MAX_PAGES_PER_ARTICLE:
+                url, source = queue.popleft()
+                normalized = normalize_download_url(url)
+                if not normalized or normalized in visited_urls:
+                    continue
+                visited_urls.append(normalized)
+                try:
+                    response = page.goto(
+                        normalized,
+                        wait_until="domcontentloaded",
+                        timeout=self.timeout_ms,
+                    )
+                    page.wait_for_timeout(750)
+                except Exception as exc:
+                    captured = self._save_first_download(
+                        downloads,
+                        destination,
+                        visited_urls,
+                    )
+                    if captured:
+                        return captured
+                    errors.append(
+                        f"{source} navigation {normalized}: {compact_error(exc)}"
+                    )
+                    continue
+
+                captured = self._save_first_download(
+                    downloads,
+                    destination,
+                    visited_urls,
+                )
+                if captured:
+                    return captured
+                if response is not None and self._save_response(response, destination):
+                    return BrowserPdfResult(
+                        url=response.url,
+                        source=f"Playwright {source} navigation response",
+                        visited_urls=visited_urls,
+                    )
+                captured_response = self._save_first_response(
+                    pdf_responses,
+                    destination,
+                    visited_urls,
+                )
+                if captured_response:
+                    return captured_response
+
+                try:
+                    links = self._page_links(page)
+                except Exception as exc:
+                    errors.append(
+                        f"{source} link inspection {page.url}: {compact_error(exc)}"
+                    )
+                    continue
+
+                for item in links:
+                    href = normalize_download_url(str(item.get("href", "")))
+                    text = normalize_space(str(item.get("text", "")))
+                    kind = str(item.get("kind", "link"))
+                    if not href:
+                        continue
+                    pdf_cue = kind == "meta" or looks_like_pdf_url(href)
+                    pdf_cue = pdf_cue or bool(PDF_ACTION_RE.search(text))
+                    if pdf_cue:
+                        try:
+                            if self._request_pdf(
+                                href,
+                                destination,
+                                referer=page.url,
+                            ):
+                                return BrowserPdfResult(
+                                    url=href,
+                                    source=f"Playwright browser-context request ({source})",
+                                    visited_urls=visited_urls,
+                                )
+                        except Exception as exc:
+                            errors.append(
+                                f"browser-context request {href}: {compact_error(exc)}"
+                            )
+                        if href not in queued:
+                            queue.appendleft((href, f"{source} PDF link"))
+                            queued.add(href)
+                        continue
+
+                    current_host = (urlparse(page.url).hostname or "").casefold()
+                    href_host = (urlparse(href).hostname or "").casefold()
+                    is_pubmed = current_host.endswith("pubmed.ncbi.nlm.nih.gov")
+                    full_text_cue = item.get("kind") == "fulltext"
+                    full_text_cue = full_text_cue or bool(
+                        FULL_TEXT_ACTION_RE.search(text)
+                    )
+                    if is_pubmed and href_host != current_host and full_text_cue:
+                        if href not in queued:
+                            queue.append((href, "PubMed full-text provider"))
+                            queued.add(href)
+
+                clicked = self._click_pdf_control(
+                    page,
+                    downloads,
+                    pdf_responses,
+                    destination,
+                    visited_urls,
+                )
+                if clicked:
+                    return clicked
+
+                current_url = normalize_download_url(page.url)
+                if current_url and current_url not in queued:
+                    queued.add(current_url)
+            reason = "; ".join(errors[-8:])
+            raise BrowserDownloadFailed(
+                reason or "no PDF control or PDF network response was found"
+            )
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def _landing_urls(self, article: Article) -> list[tuple[str, str]]:
+        urls = [(article.pubmed_url, "PubMed article page")]
+        if article.doi:
+            urls.append(
+                (
+                    f"https://doi.org/{quote(article.doi, safe='/():;')}",
+                    "DOI publisher page",
+                )
+            )
+        if article.pmc_url:
+            urls.append((article.pmc_url, "PMC article page"))
+        return urls
+
+    def _page_links(self, page: Any) -> list[dict[str, str]]:
+        return page.evaluate(
+            """
+            () => {
+              const rows = [];
+              for (const meta of document.querySelectorAll(
+                'meta[name="citation_pdf_url"], meta[name="eprints.document_url"]'
+              )) {
+                if (meta.content) {
+                  rows.push({href: meta.content, text: 'citation PDF', kind: 'meta'});
+                }
+              }
+              for (const node of document.querySelectorAll('a[href]')) {
+                const imageAlt = Array.from(node.querySelectorAll('img[alt]'))
+                  .map(image => image.getAttribute('alt') || '')
+                  .join(' ');
+                const fullTextContainer = node.closest(
+                  '.full-text-links-list, .full-text-links, #linkout, ' +
+                  '[data-ga-action="Full Text Sources"]'
+                );
+                rows.push({
+                  href: node.href || '',
+                  text: [
+                    node.innerText || '',
+                    node.getAttribute('aria-label') || '',
+                    node.getAttribute('title') || '',
+                    imageAlt
+                  ].join(' ').trim(),
+                  kind: fullTextContainer ? 'fulltext' : 'link'
+                });
+              }
+              return rows;
+            }
+            """
+        )
+
+    def _click_pdf_control(
+        self,
+        page: Any,
+        downloads: list[Any],
+        pdf_responses: list[Any],
+        destination: Path,
+        visited_urls: list[str],
+    ) -> BrowserPdfResult | None:
+        controls = page.locator("button, [role='button'], a:not([href])")
+        try:
+            count = min(controls.count(), 250)
+        except Exception:
+            return None
+        clicked = 0
+        for index in range(count):
+            control = controls.nth(index)
+            try:
+                text = normalize_space(
+                    " ".join(
+                        (
+                            control.inner_text(timeout=1_000),
+                            control.get_attribute("aria-label") or "",
+                            control.get_attribute("title") or "",
+                        )
+                    )
+                )
+                if not PDF_ACTION_RE.search(text):
+                    continue
+                clicked += 1
+                before_pages = set(self._context.pages)
+                control.click(timeout=min(self.timeout_ms, 8_000))
+                page.wait_for_timeout(1_500)
+                captured = self._save_first_download(
+                    downloads,
+                    destination,
+                    visited_urls,
+                )
+                if captured:
+                    return captured
+                captured_response = self._save_first_response(
+                    pdf_responses,
+                    destination,
+                    visited_urls,
+                )
+                if captured_response:
+                    return captured_response
+                for popup in set(self._context.pages) - before_pages:
+                    popup_url = normalize_download_url(popup.url)
+                    if popup_url and self._request_pdf(
+                        popup_url,
+                        destination,
+                        referer=page.url,
+                    ):
+                        return BrowserPdfResult(
+                            url=popup_url,
+                            source="Playwright PDF popup",
+                            visited_urls=visited_urls,
+                        )
+                if clicked >= BROWSER_MAX_CLICK_TARGETS:
+                    break
+            except Exception:
+                continue
+        return None
+
+    def _request_pdf(
+        self,
+        url: str,
+        destination: Path,
+        *,
+        referer: str,
+    ) -> bool:
+        response = self._context.request.get(
+            url,
+            headers={"Referer": referer, "Accept": "application/pdf,*/*;q=0.8"},
+            fail_on_status_code=False,
+            timeout=self.timeout_ms,
+        )
+        try:
+            if not 200 <= response.status < 300:
+                return False
+            headers = {
+                str(key).casefold(): str(value)
+                for key, value in response.headers.items()
+            }
+            declared = parse_content_length(headers.get("content-length"))
+            if declared is not None and declared > MAX_PDF_BYTES:
+                return False
+            if not headers_indicate_pdf(headers) and not looks_like_pdf_url(
+                response.url
+            ):
+                return False
+            body = response.body()
+            if len(body) > MAX_PDF_BYTES or not body_is_pdf(body):
+                return False
+            destination.write_bytes(body)
+            return True
+        finally:
+            response.dispose()
+
+    def _save_response(self, response: Any, destination: Path) -> bool:
+        try:
+            headers = {
+                str(key).casefold(): str(value)
+                for key, value in response.headers.items()
+            }
+            if not headers_indicate_pdf(headers):
+                return False
+            declared = parse_content_length(headers.get("content-length"))
+            if declared is not None and declared > MAX_PDF_BYTES:
+                return False
+            body = response.body()
+            if len(body) > MAX_PDF_BYTES or not body_is_pdf(body):
+                return False
+            destination.write_bytes(body)
+            return True
+        except Exception:
+            return False
+
+    def _save_first_response(
+        self,
+        responses: list[Any],
+        destination: Path,
+        visited_urls: list[str],
+    ) -> BrowserPdfResult | None:
+        while responses:
+            response = responses.pop(0)
+            if self._save_response(response, destination):
+                return BrowserPdfResult(
+                    url=response.url,
+                    source="Playwright captured PDF network response",
+                    visited_urls=visited_urls,
+                )
+        return None
+
+    def _save_first_download(
+        self,
+        downloads: list[Any],
+        destination: Path,
+        visited_urls: list[str],
+    ) -> BrowserPdfResult | None:
+        while downloads:
+            download = downloads.pop(0)
+            try:
+                download.save_as(str(destination))
+                with destination.open("rb") as handle:
+                    signature = handle.read(1_024)
+                if b"%PDF-" not in signature:
+                    destination.unlink(missing_ok=True)
+                    continue
+                return BrowserPdfResult(
+                    url=download.url,
+                    source="Playwright browser download event",
+                    visited_urls=visited_urls,
+                )
+            except Exception:
+                destination.unlink(missing_ok=True)
+        return None
+
+
+def download_pdf(
+    client: HttpClient,
+    candidate: PdfCandidate,
+    destination: Path,
+    *,
+    title: str,
+) -> int:
+    """Download one PDF, retrying interrupted response bodies with backoff."""
+
+    reasons: list[str] = []
+    attempts = client.retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return download_pdf_once(
+                client,
+                candidate,
+                destination,
+                title=title,
+            )
+        except StreamDownloadFailed as exc:
+            reasons.append(compact_error(exc))
+            if attempt >= attempts:
+                break
+            delay = min(2 ** (attempt - 1), 30)
+            tqdm.write(
+                f"  retry {attempt}/{client.retries} for interrupted PDF "
+                f"in {delay:g}s: {reasons[-1]}",
+                file=sys.stdout,
+            )
+            time.sleep(delay)
+
+    raise RequestFailed(candidate.url, len(reasons), reasons)
+
+
+def download_pdf_once(
+    client: HttpClient,
+    candidate: PdfCandidate,
+    destination: Path,
+    *,
+    title: str,
+) -> int:
+    response = client.request(
+        "GET",
+        candidate.url,
+        stream=True,
+        allow_redirects=True,
+    )
+    total_header = response.headers.get("Content-Length")
+    try:
+        total = int(total_header) if total_header else None
+    except ValueError:
+        total = None
+    if total is not None and total > MAX_PDF_BYTES:
+        response.close()
+        raise InvalidPdf(
+            f"declared PDF size {total} exceeds the {MAX_PDF_BYTES}-byte limit"
+        )
+
+    bytes_written = 0
+    try:
+        with (
+            destination.open("wb") as handle,
+            tqdm(
+                total=total,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=f"  {truncate(title, 42)}",
+                leave=False,
+                file=sys.stdout,
+            ) as progress,
+        ):
+            for chunk in response.iter_content(chunk_size=128 * 1024):
+                if not chunk:
+                    continue
+                bytes_written += len(chunk)
+                if bytes_written > MAX_PDF_BYTES:
+                    raise InvalidPdf(
+                        f"download exceeded the {MAX_PDF_BYTES}-byte limit"
+                    )
+                handle.write(chunk)
+                progress.update(len(chunk))
+    except requests.RequestException as exc:
+        destination.unlink(missing_ok=True)
+        raise StreamDownloadFailed(
+            f"PDF response body was interrupted: {compact_error(exc)}"
+        ) from exc
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        response.close()
+
+    try:
+        with destination.open("rb") as handle:
+            signature = handle.read(1_024)
+        if b"%PDF-" not in signature:
+            raise InvalidPdf(
+                "server returned non-PDF content "
+                f"({bytes_written} bytes; first bytes {signature[:16]!r})"
+            )
+        return pdf_page_count(destination)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def pdf_page_count(path: Path) -> int:
+    try:
+        reader = PdfReader(str(path), strict=False)
+        if reader.is_encrypted and reader.decrypt("") == 0:
+            raise InvalidPdf("PDF is encrypted and cannot be opened")
+        count = len(reader.pages)
+    except InvalidPdf:
+        raise
+    except Exception as exc:
+        raise InvalidPdf(f"PDF parser rejected the file: {compact_error(exc)}") from exc
+    if count < 1:
+        raise InvalidPdf("PDF contains no pages")
+    return count
+
+
+def article_metadata(article: Article, query: str) -> dict[str, Any]:
+    record = asdict(article)
+    record.update(
+        {
+            "pubmed_url": article.pubmed_url,
+            "pmc_url": article.pmc_url,
+            "doi_url": (f"https://doi.org/{article.doi}" if article.doi else None),
+            "search_query": query,
+            "search_sort": "relevance",
+            "retrieval": {
+                "status": "pending",
+                "pdf_url": None,
+                "pdf_source": None,
+                "local_path": None,
+                "page_count": None,
+                "failure_reason": None,
+                "candidate_urls": [],
+                "candidate_errors": [],
+            },
+        }
+    )
+    return record
+
+
+def safe_pdf_filename(title: str, *, max_bytes: int = 220) -> str:
+    normalized = unicodedata.normalize("NFKC", html.unescape(title))
+    normalized = re.sub(r"\s+", "_", normalized.strip())
+    normalized = re.sub(r"[\x00-\x1f\x7f/:\\?*<>|\"']", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("._")
+    if not normalized:
+        normalized = "untitled_article"
+
+    suffix = ".pdf"
+    byte_budget = max_bytes - len(suffix.encode("utf-8"))
+    while len(normalized.encode("utf-8")) > byte_budget:
+        normalized = normalized[:-1]
+    normalized = normalized.rstrip("._") or "untitled_article"
+    return normalized + suffix
+
+
+def unique_target_path(
+    output_dir: Path,
+    article: Article,
+    claimed_paths: set[Path],
+) -> Path:
+    primary = output_dir / safe_pdf_filename(article.title)
+    if primary not in claimed_paths:
+        claimed_paths.add(primary)
+        return primary
+
+    stem = primary.stem
+    suffix = f"__{article.pmid}.pdf"
+    byte_budget = 220 - len(suffix.encode("utf-8"))
+    while len(stem.encode("utf-8")) > byte_budget:
+        stem = stem[:-1]
+    alternate = output_dir / f"{stem.rstrip('._')}{suffix}"
+    claimed_paths.add(alternate)
+    return alternate
+
+
+def resolve_output_path(value: str | Path, output_dir: Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else output_dir / path
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        delete=False,
+    )
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def use_existing_pdf(path: Path, min_length: int) -> tuple[bool, int | None, str]:
+    if not path.exists():
+        return False, None, ""
+    try:
+        pages = pdf_page_count(path)
+    except InvalidPdf as exc:
+        return False, None, f"existing file is invalid: {exc}"
+    if pages < min_length:
+        return (
+            False,
+            pages,
+            f"existing file has {pages} page(s), below minimum {min_length}",
+        )
+    return True, pages, ""
+
+
+def collect_candidates_with_feedback(
+    client: HttpClient,
+    args: argparse.Namespace,
+    *,
+    gemini_auth_path: Path,
+    query_plan: QueryPlan | None = None,
+    initial_budget_warning_reported: bool = False,
+    initial_seen_pmids: Iterable[str] = (),
+    on_round: Callable[[CandidateRound], bool] | None = None,
+) -> CandidateSearchResult:
+    """Walk deeper while the selected LLM refines noisy title exclusions."""
+
+    query_plan = query_plan or QueryPlan(mode="default")
+    provider = screening_provider_name(args)
+    provider_label = screening_provider_label(provider)
+    screening_model = screening_model_name(args)
+    active_exclusions = list(args.exclude_terms)
+    automatically_applied: list[str] = []
+    seen_pmids = {str(pmid) for pmid in initial_seen_pmids}
+    all_articles: list[Article] = []
+    all_screenable: list[Article] = []
+    all_missing_pmids: list[str] = []
+    selections: list[GeminiSelection] = []
+    query_by_pmid: dict[str, str] = {}
+    rank_by_pmid: dict[str, int] = {}
+    round_by_pmid: dict[str, int] = {}
+    query_rounds: list[dict[str, Any]] = []
+    reported_budget_fits: set[tuple[int, int, bool]] = set()
+    rounds_completed = 0
+    stop_reason = "query_exhausted"
+    max_rounds_exhausted = False
+    batch_size = max(args.max_tries, args.max_articles)
+    final_fit = fit_pubmed_query(
+        build_query_for_plan(
+            query_plan,
+            args.max_age,
+            active_exclusions,
+        ),
+        args.max_query_length,
+    )
+    final_query = final_fit.query
+    automatic_exclusion_budget_exhausted = final_fit.removed_alternatives > 0
+
+    for round_number in range(1, args.max_rounds + 1):
+        query_exclusions = list(active_exclusions)
+        query_fit = fit_pubmed_query(
+            build_query_for_plan(
+                query_plan,
+                args.max_age,
+                active_exclusions,
+            ),
+            args.max_query_length,
+        )
+        query = query_fit.query
+        final_query = query
+        fit_signature = (
+            query_fit.original_encoded_length,
+            query_fit.removed_alternatives,
+            query_fit.compacted,
+        )
+        if (
+            query_fit.modified
+            and fit_signature not in reported_budget_fits
+            and not (round_number == 1 and initial_budget_warning_reported)
+        ):
+            print_query_budget_warning(
+                query_fit,
+                args.max_query_length,
+                context=f"PubMed query in search round {round_number}",
+            )
+            reported_budget_fits.add(fit_signature)
+        search_limit = min(MAX_PUBMED_RESULTS, len(seen_pmids) + batch_size)
+        pmids, total_hits = search_pubmed(client, query, search_limit)
+        new_pmids = [pmid for pmid in pmids if pmid not in seen_pmids][:batch_size]
+        if not new_pmids:
+            query_rounds.append(
+                {
+                    "round": round_number,
+                    "query": query,
+                    "pubmed_total_hits": total_hits,
+                    "requested_results": search_limit,
+                    "new_pmids": 0,
+                    "stop_reason": "PubMed returned no unseen records",
+                    "query_additional_exclusions": query_exclusions,
+                    "next_round_additional_exclusions": list(active_exclusions),
+                }
+            )
+            print(
+                f"Search round {round_number}: no unseen PubMed records remain.",
+                flush=True,
+            )
+            stop_reason = "no_unseen_records"
+            break
+
+        print(
+            f"Search round {round_number}: PubMed found {total_hits:,}; "
+            f"fetching {len(new_pmids):,} unseen relevance-sorted record(s).",
+            flush=True,
+        )
+        seen_pmids.update(new_pmids)
+        query_rank = {pmid: rank for rank, pmid in enumerate(pmids, start=1)}
+        for pmid in new_pmids:
+            query_by_pmid[pmid] = query
+            rank_by_pmid[pmid] = query_rank[pmid]
+            round_by_pmid[pmid] = round_number
+
+        articles = fetch_pubmed_articles(client, new_pmids)
+        for article in articles:
+            article.search_rank = query_rank[article.pmid]
+        returned_pmids = {article.pmid for article in articles}
+        missing_pmids = [pmid for pmid in new_pmids if pmid not in returned_pmids]
+        all_missing_pmids.extend(missing_pmids)
+        all_articles.extend(articles)
+
+        screenable = [
+            article
+            for article in articles
+            if (
+                (page_estimate := pagination_page_count(article.pagination)) is None
+                or page_estimate >= args.min_length
+            )
+        ]
+        all_screenable.extend(screenable)
+        short_count = len(articles) - len(screenable)
+        print(
+            f"Search round {round_number}: MEDLINE pagination skipped "
+            f"{short_count:,} short record(s); sending {len(screenable):,} "
+            f"length-possible record(s) to {provider_label}.",
+            flush=True,
+        )
+
+        earlier_failure = next(
+            (
+                selection
+                for selection in selections
+                if selection.fallback and not selection.used
+            ),
+            None,
+        )
+        if earlier_failure is not None:
+            selection = fail_open_screening_selection(
+                screenable,
+                model=screening_model,
+                error=earlier_failure.error
+                or f"an earlier {provider_label} batch failed",
+                provider=provider,
+            )
+        elif provider == "openai":
+            selection = screen_articles_with_openai_in_batches(
+                screenable,
+                model=screening_model,
+                retries=args.retries,
+                screening_instructions=query_plan.screening_instructions,
+            )
+        else:
+            selection = screen_articles_with_gemini_in_batches(
+                screenable,
+                auth_path=gemini_auth_path,
+                model=args.gemini_model,
+                location=args.gemini_location,
+                retries=args.retries,
+                screening_instructions=query_plan.screening_instructions,
+            )
+        selections.append(selection)
+
+        rejected_count = sum(
+            decision.get("decision") == "rejected"
+            for decision in selection.decisions.values()
+        )
+        approved_count = len(selection.approved_pmids)
+        rejection_rate = rejected_count / len(screenable) if screenable else 0.0
+        applied_this_round: list[str] = []
+        budget_omitted: list[str] = []
+        impactful_suggestions: list[str] = []
+        if (
+            selection.used
+            and len(screenable) >= 10
+            and rejection_rate >= GEMINI_REFINEMENT_REJECTION_RATE
+            and len(automatically_applied) < MAX_AUTOMATIC_EXCLUSIONS
+            and not automatic_exclusion_budget_exhausted
+        ):
+            impactful_suggestions = safe_automatic_exclusions(
+                selection,
+                screenable,
+                active_exclusions,
+                implicit_exclusions=(
+                    BUILTIN_TITLE_EXCLUSIONS
+                    if query_plan.mode == "default"
+                    or (
+                        query_plan.mode == "yaml"
+                        and query_plan.yaml_document is not None
+                        and query_plan.yaml_document.get(
+                            "use_default_exclusions",
+                            False,
+                        )
+                    )
+                    else ()
+                ),
+            )
+            remaining_slots = MAX_AUTOMATIC_EXCLUSIONS - len(automatically_applied)
+            impactful_suggestions = impactful_suggestions[:remaining_slots]
+            applied_this_round, budget_omitted = exclusions_within_query_budget(
+                query_plan,
+                max_age=args.max_age,
+                active_exclusions=active_exclusions,
+                suggestions=impactful_suggestions,
+                max_encoded_length=args.max_query_length,
+            )
+            active_exclusions.extend(applied_this_round)
+            automatically_applied.extend(applied_this_round)
+            if budget_omitted:
+                automatic_exclusion_budget_exhausted = True
+
+        continuation_fit = fit_pubmed_query(
+            build_query_for_plan(
+                query_plan,
+                args.max_age,
+                active_exclusions,
+            ),
+            args.max_query_length,
+        )
+        continuation_query = continuation_fit.query
+        final_query = continuation_query
+        round_record = {
+            "round": round_number,
+            "query": query,
+            "pubmed_total_hits": total_hits,
+            "requested_results": search_limit,
+            "new_pmids": len(new_pmids),
+            "metadata_records": len(articles),
+            "pagination_short": short_count,
+            "screening_provider": provider,
+            "screening_model": screening_model,
+            "screened": len(screenable),
+            "approved": approved_count,
+            "rejected": rejected_count,
+            "rejection_rate": rejection_rate,
+            "suggested_exclusions": selection.suggested_exclusions,
+            # Retain historical keys for report compatibility.
+            "gemini_screened": len(screenable),
+            "gemini_approved": approved_count,
+            "gemini_rejected": rejected_count,
+            "gemini_rejection_rate": rejection_rate,
+            "gemini_suggested_exclusions": selection.suggested_exclusions,
+            "impactful_safe_exclusions": impactful_suggestions,
+            "automatically_applied_exclusions": applied_this_round,
+            "query_budget_omitted_exclusions": budget_omitted,
+            "query_original_encoded_length": query_fit.original_encoded_length,
+            "query_encoded_length": query_fit.encoded_length,
+            "query_max_encoded_length": args.max_query_length,
+            "query_compacted": query_fit.compacted,
+            "query_removed_alternatives": query_fit.removed_alternatives,
+            "automatic_exclusion_budget_exhausted": (
+                automatic_exclusion_budget_exhausted
+            ),
+            "query_additional_exclusions": query_exclusions,
+            "next_round_additional_exclusions": list(active_exclusions),
+            "continuation_query": continuation_query,
+        }
+        query_rounds.append(round_record)
+        if applied_this_round:
+            print(
+                f"Search round {round_number}: {provider_label} rejected "
+                f"{rejection_rate:.0%}; automatically adding title exclusions: "
+                + ", ".join(applied_this_round),
+                flush=True,
+            )
+        if budget_omitted:
+            print(
+                "WARNING: PubMed query reached "
+                f"--max-query-length={args.max_query_length:,}; stopping "
+                "automatic exclusions before: " + ", ".join(budget_omitted),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        rounds_completed = round_number
+        if on_round is not None:
+            limit_reached = on_round(
+                CandidateRound(
+                    round_number=round_number,
+                    query=query,
+                    continuation_query=continuation_query,
+                    articles=articles,
+                    screenable_articles=screenable,
+                    missing_pmids=missing_pmids,
+                    gemini_selection=selection,
+                    rank_by_pmid={
+                        pmid: query_rank[pmid] for pmid in new_pmids
+                    },
+                )
+            )
+            if limit_reached:
+                round_record["stop_reason"] = "download_limit_reached"
+                stop_reason = "download_limit_reached"
+                break
+
+        current_query_exhausted = total_hits <= len(pmids)
+        if current_query_exhausted and not applied_this_round:
+            stop_reason = "query_exhausted"
+            break
+        if len(seen_pmids) >= MAX_PUBMED_RESULTS:
+            print(
+                f"Warning: reached PubMed's {MAX_PUBMED_RESULTS:,}-record scan cap.",
+                flush=True,
+            )
+            stop_reason = "pubmed_record_cap_reached"
+            break
+    else:
+        max_rounds_exhausted = True
+        stop_reason = "max_rounds_exhausted"
+
+    aggregate_selection = merge_gemini_selections(
+        selections,
+        model=screening_model,
+        provider=provider,
+    )
+    return CandidateSearchResult(
+        articles=all_articles,
+        screenable_articles=all_screenable,
+        missing_pmids=all_missing_pmids,
+        gemini_selection=aggregate_selection,
+        query_by_pmid=query_by_pmid,
+        rank_by_pmid=rank_by_pmid,
+        round_by_pmid=round_by_pmid,
+        query_rounds=query_rounds,
+        automatically_applied_exclusions=automatically_applied,
+        final_query=final_query,
+        seen_pmids=sorted(seen_pmids, key=int),
+        rounds_completed=rounds_completed,
+        stop_reason=stop_reason,
+        max_rounds_exhausted=max_rounds_exhausted,
+    )
+
+
+def process_candidate_round(
+    candidate_round: CandidateRound,
+    *,
+    args: argparse.Namespace,
+    query_plan: QueryPlan,
+    client: HttpClient,
+    browser: BrowserPdfDownloader,
+    output_dir: Path,
+    outputs: OutputFiles,
+    counts: dict[str, int],
+    claimed_paths: set[Path],
+    completed_pmids: set[str],
+) -> bool:
+    """Download one LLM-screened batch and report whether a limit was hit."""
+
+    articles = candidate_round.articles
+    selection = candidate_round.gemini_selection
+    provider_label = screening_provider_label(selection.provider)
+    counts["considered"] += len(articles) + len(candidate_round.missing_pmids)
+    counts["screened"] += len(candidate_round.screenable_articles)
+
+    for pmid in candidate_round.missing_pmids:
+        missing_title = f"PubMed {pmid}"
+        missing_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+        reason = "PubMed did not return metadata for the requested PMID"
+        outputs.failure(missing_title, missing_url, reason)
+        outputs.metadata(
+            {
+                "pmid": pmid,
+                "title": missing_title,
+                "pubmed_url": missing_url,
+                "search_rank": candidate_round.rank_by_pmid.get(pmid),
+                "search_round": candidate_round.round_number,
+                "search_query": candidate_round.query,
+                "search_sort": "relevance",
+                "query_mode": query_plan.mode,
+                "query_source": query_plan.source,
+                "retrieval": {
+                    "status": "failed",
+                    "failure_reason": reason,
+                },
+            }
+        )
+        counts["metadata_missing"] += 1
+        completed_pmids.add(pmid)
+
+    for article in tqdm(
+        articles,
+        desc=f"Round {candidate_round.round_number} downloads",
+        unit="article",
+        file=sys.stdout,
+    ):
+        metadata = article_metadata(article, candidate_round.query)
+        metadata["search_round"] = candidate_round.round_number
+        metadata["query_mode"] = query_plan.mode
+        metadata["query_source"] = query_plan.source
+        retrieval = metadata["retrieval"]
+        if query_plan.mode == "default":
+            relevance = assess_relevance(article, args.exclude_terms)
+            metadata["relevance"] = asdict(relevance)
+        else:
+            metadata["relevance"] = {
+                "mode": "custom_query",
+                "eligible": None,
+                "reason": (
+                    "Intelligence-specific local term diagnostics are disabled; "
+                    f"{provider_label} used the custom screening profile"
+                ),
+            }
+        page_estimate = pagination_page_count(article.pagination)
+        metadata["pagination_estimated_pages"] = page_estimate
+
+        if page_estimate is not None and page_estimate < args.min_length:
+            retrieval["status"] = "below_minimum_length_metadata"
+            retrieval["page_count"] = page_estimate
+            retrieval["failure_reason"] = (
+                f"MEDLINE pagination {article.pagination!r} spans "
+                f"{page_estimate} page(s), below minimum {args.min_length}"
+            )
+            screening_metadata = {
+                "decision": "not_screened",
+                "reason": "Known to be below the minimum length",
+                "used": False,
+                "fallback": False,
+                "model": selection.model,
+                "provider": selection.provider,
+            }
+            metadata["screening"] = screening_metadata
+            metadata[selection.provider] = screening_metadata
+            outputs.metadata(metadata)
+            counts["metadata_short"] += 1
+            completed_pmids.add(article.pmid)
+            tqdm.write(
+                f"[TOO SHORT FROM PAGINATION] {article.title} "
+                f"({page_estimate} pages)",
+                file=sys.stdout,
+            )
+            continue
+
+        screening_decision = selection.decisions.get(
+            article.pmid,
+            {
+                "decision": "approved",
+                "reason": "No decision found; fail-open approval",
+            },
+        )
+        screening_metadata = {
+            **screening_decision,
+            "used": selection.used,
+            "fallback": selection.fallback,
+            "model": selection.model,
+            "provider": selection.provider,
+        }
+        metadata["screening"] = screening_metadata
+        metadata[selection.provider] = screening_metadata
+
+        if article.pmid not in selection.approved_pmids:
+            retrieval["status"] = f"{selection.provider}_rejected"
+            retrieval["failure_reason"] = screening_decision["reason"]
+            outputs.metadata(metadata)
+            counts["screening_rejected"] += 1
+            completed_pmids.add(article.pmid)
+            tqdm.write(
+                f"[{provider_label.upper()} REJECTED] {article.title}: "
+                f"{screening_decision['reason']}",
+                file=sys.stdout,
+            )
+            continue
+
+        if counts["downloaded"] >= args.max_articles:
+            retrieval["status"] = "not_attempted_max_articles_reached"
+            retrieval["failure_reason"] = (
+                f"run already downloaded --max-articles={args.max_articles} "
+                "new PDFs"
+            )
+            outputs.metadata(metadata)
+            counts["limit_skipped"] += 1
+            continue
+
+        if counts["tries"] >= args.max_tries:
+            retrieval["status"] = "not_attempted_max_tries_reached"
+            retrieval["failure_reason"] = (
+                f"run already reached --max-tries={args.max_tries} "
+                "qualifying-length outcomes"
+            )
+            outputs.metadata(metadata)
+            counts["limit_skipped"] += 1
+            continue
+
+        target = unique_target_path(output_dir, article, claimed_paths)
+        existing, existing_pages, existing_reason = use_existing_pdf(
+            target,
+            args.min_length,
+        )
+        if existing:
+            retrieval.update(
+                {
+                    "status": "existing",
+                    "local_path": str(target),
+                    "page_count": existing_pages,
+                }
+            )
+            outputs.success(article.title, article.pubmed_url)
+            outputs.metadata(metadata)
+            counts["existing"] += 1
+            completed_pmids.add(article.pmid)
+            tqdm.write(
+                f"[EXISTING] {article.title} ({existing_pages} pages)",
+                file=sys.stdout,
+            )
+            continue
+
+        if existing_pages is not None:
+            retrieval.update(
+                {
+                    "status": "below_minimum_length_existing",
+                    "local_path": str(target),
+                    "page_count": existing_pages,
+                    "failure_reason": existing_reason,
+                }
+            )
+            outputs.metadata(metadata)
+            counts["pdf_short"] += 1
+            completed_pmids.add(article.pmid)
+            tqdm.write(
+                f"[TOO SHORT EXISTING] {article.title} "
+                f"({existing_pages} pages)",
+                file=sys.stdout,
+            )
+            continue
+
+        counts["attempted"] += 1
+        candidates, discovery, discovery_errors = discover_pdf_candidates(
+            client,
+            article,
+        )
+        metadata["pdf_discovery"] = discovery
+        retrieval["candidate_urls"] = [
+            {"url": item.url, "source": item.source} for item in candidates
+        ]
+        retrieval["candidate_errors"] = discovery_errors
+        errors = list(discovery_errors)
+        if existing_reason:
+            errors.append(existing_reason)
+
+        downloaded = False
+        too_short = False
+        for candidate in candidates:
+            temp_path = make_temp_pdf_path(output_dir)
+            try:
+                page_count = download_pdf(
+                    client,
+                    candidate,
+                    temp_path,
+                    title=article.title,
+                )
+                if page_count < args.min_length:
+                    temp_path.unlink(missing_ok=True)
+                    errors.append(
+                        f"{candidate.source}: PDF has {page_count} page(s), "
+                        f"below minimum {args.min_length}"
+                    )
+                    retrieval["page_count"] = page_count
+                    too_short = True
+                    continue
+
+                os.replace(temp_path, target)
+                retrieval.update(
+                    {
+                        "status": "downloaded",
+                        "pdf_url": candidate.url,
+                        "pdf_source": candidate.source,
+                        "local_path": str(target),
+                        "page_count": page_count,
+                        "failure_reason": None,
+                    }
+                )
+                outputs.success(article.title, article.pubmed_url)
+                counts["downloaded"] += 1
+                counts["tries"] += 1
+                downloaded = True
+                tqdm.write(
+                    f"[DOWNLOADED] {article.title} "
+                    f"({page_count} pages) -> {target.name}",
+                    file=sys.stdout,
+                )
+                break
+            except (InvalidPdf, RequestFailed, OSError) as exc:
+                temp_path.unlink(missing_ok=True)
+                errors.append(
+                    f"{candidate.source} ({candidate.url}): "
+                    f"{compact_error(exc)}"
+                )
+
+        if not downloaded:
+            temp_path = make_temp_pdf_path(output_dir)
+            try:
+                browser_result = browser.download(article, temp_path)
+                page_count = pdf_page_count(temp_path)
+                retrieval["browser"] = {
+                    "visited_urls": browser_result.visited_urls,
+                    "captured_url": browser_result.url,
+                    "source": browser_result.source,
+                }
+                if page_count < args.min_length:
+                    temp_path.unlink(missing_ok=True)
+                    errors.append(
+                        f"{browser_result.source}: PDF has {page_count} "
+                        f"page(s), below minimum {args.min_length}"
+                    )
+                    retrieval["page_count"] = page_count
+                    too_short = True
+                else:
+                    os.replace(temp_path, target)
+                    retrieval.update(
+                        {
+                            "status": "downloaded",
+                            "pdf_url": browser_result.url,
+                            "pdf_source": browser_result.source,
+                            "local_path": str(target),
+                            "page_count": page_count,
+                            "failure_reason": None,
+                        }
+                    )
+                    outputs.success(article.title, article.pubmed_url)
+                    counts["downloaded"] += 1
+                    counts["tries"] += 1
+                    downloaded = True
+                    tqdm.write(
+                        f"[DOWNLOADED VIA BROWSER] {article.title} "
+                        f"({page_count} pages) -> {target.name}",
+                        file=sys.stdout,
+                    )
+            except (BrowserDownloadFailed, InvalidPdf, OSError) as exc:
+                temp_path.unlink(missing_ok=True)
+                errors.append(f"Playwright browser: {compact_error(exc)}")
+
+        if not downloaded:
+            if too_short:
+                retrieval["status"] = "below_minimum_length"
+                counts["pdf_short"] += 1
+            else:
+                retrieval["status"] = "failed"
+            if not candidates and not too_short:
+                errors.append("no direct free PDF URL could be discovered")
+            reason = "; ".join(errors) or "PDF download failed"
+            retrieval["failure_reason"] = reason
+            if too_short:
+                tqdm.write(
+                    f"[TOO SHORT] {article.title}: {reason}",
+                    file=sys.stdout,
+                )
+            else:
+                outputs.failure(article.title, article.pubmed_url, reason)
+                counts["failed"] += 1
+                counts["tries"] += 1
+                tqdm.write(
+                    f"[FAILED] {article.title}: {reason}",
+                    file=sys.stdout,
+                )
+
+        outputs.metadata(metadata)
+        completed_pmids.add(article.pmid)
+
+    return (
+        counts["downloaded"] >= args.max_articles
+        or counts["tries"] >= args.max_tries
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    output_dir = args.output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    failure_path = resolve_output_path(args.failure_list, output_dir)
+    success_path = resolve_output_path(args.success_list, output_dir)
+    metadata_path = resolve_output_path(args.metadata, output_dir)
+    gemini_auth_path = resolve_output_path(args.gemini_auth, output_dir)
+    llm_report_path = resolve_output_path(args.llm_report, output_dir)
+    continuation_state_path = resolve_output_path(
+        args.continuation_state,
+        output_dir,
+    )
+    report_paths = {
+        failure_path.resolve(),
+        success_path.resolve(),
+        metadata_path.resolve(),
+        llm_report_path.resolve(),
+        continuation_state_path.resolve(),
+    }
+    if len(report_paths) != 5:
+        raise PubMedleyError(
+            "--failure-list, --success-list, --metadata, --llm-report, and "
+            "--continuation-state must be different files"
+        )
+
+    resume_payload: dict[str, Any] | None = None
+    initial_seen_pmids: set[str] = set()
+    if args.resume_from is not None:
+        resume_path = resolve_output_path(args.resume_from, output_dir)
+        resume_payload = load_continuation_state(resume_path)
+        initial_seen_pmids.update(resume_payload["completed_pmids"])
+
+    if (
+        resume_payload is not None
+        and args.query is None
+        and args.query_yaml is None
+    ):
+        prompt_filters = load_prompt_filters(args.prompt_filter)
+        saved_screening = normalize_space(
+            str(resume_payload.get("screening_instructions", ""))
+        )
+        query_plan = QueryPlan(
+            mode="compiled",
+            raw_query=resume_payload["current_query"],
+            screening_instructions=append_prompt_filters(
+                saved_screening
+                or generic_screening_instructions(
+                    resume_payload["current_query"]
+                ),
+                prompt_filters,
+            ),
+            prompt_filters=prompt_filters,
+            source=f"continuation state {args.resume_from}",
+            pmc_only=args.pmc_only,
+        )
+    else:
+        query_plan = prepare_query_plan(args)
+    initial_query_fit = fit_pubmed_query(
+        build_query_for_plan(
+            query_plan,
+            args.max_age,
+            args.exclude_terms,
+        ),
+        args.max_query_length,
+    )
+    initial_query = initial_query_fit.query
+    print_query_budget_warning(
+        initial_query_fit,
+        args.max_query_length,
+        context="Initial PubMed query",
+    )
+    if initial_query_fit.modified:
+        synchronize_derived_screening_with_query(
+            query_plan,
+            initial_query,
+        )
+    print(f"Output directory: {output_dir}", flush=True)
+    print(f"Query source: {query_plan.source}", flush=True)
+    print(f"Initial PubMed query: {initial_query}", flush=True)
+    active_provider = screening_provider_name(args)
+    active_provider_label = screening_provider_label(active_provider)
+    active_model = screening_model_name(args)
+    print(
+        f"Relevance screening: {active_provider_label} ({active_model})",
+        flush=True,
+    )
+    if resume_payload is not None:
+        print(
+            f"Resuming with {len(initial_seen_pmids):,} previously completed "
+            "PMID(s); those records will not be sent to the LLM or downloaded "
+            "again.",
+            flush=True,
+        )
+    if not args.email:
+        print(
+            "Note: NCBI_EMAIL is not set; using anonymous NCBI rate limits.",
+            flush=True,
+        )
+
+    client = HttpClient(
+        retries=args.retries,
+        timeout=args.timeout,
+        email=args.email,
+        api_key=args.api_key,
+    )
+    browser = BrowserPdfDownloader(timeout=args.timeout, retries=args.retries)
+    try:
+        counts = {
+            "considered": 0,
+            "screened": 0,
+            "tries": 0,
+            "attempted": 0,
+            "downloaded": 0,
+            "existing": 0,
+            "failed": 0,
+            "metadata_missing": 0,
+            "metadata_short": 0,
+            "pdf_short": 0,
+            "screening_rejected": 0,
+            "limit_skipped": 0,
+        }
+        claimed_paths: set[Path] = set()
+        completed_pmids = set(initial_seen_pmids)
+        with OutputFiles(
+            failure_path=failure_path,
+            success_path=success_path,
+            metadata_path=metadata_path,
+            append=resume_payload is not None,
+        ) as outputs:
+
+            def process_round(candidate_round: CandidateRound) -> bool:
+                limit_reached = process_candidate_round(
+                    candidate_round,
+                    args=args,
+                    query_plan=query_plan,
+                    client=client,
+                    browser=browser,
+                    output_dir=output_dir,
+                    outputs=outputs,
+                    counts=counts,
+                    claimed_paths=claimed_paths,
+                    completed_pmids=completed_pmids,
+                )
+                write_continuation_state(
+                    continuation_state_path,
+                    status=(
+                        "download_limit_reached"
+                        if limit_reached
+                        else "round_checkpoint"
+                    ),
+                    current_query=candidate_round.continuation_query,
+                    completed_pmids=completed_pmids,
+                    rounds_completed=candidate_round.round_number,
+                    max_rounds_exhausted=False,
+                    query_plan=query_plan,
+                    counts=counts,
+                )
+                return limit_reached
+
+            search_result = collect_candidates_with_feedback(
+                client,
+                args,
+                gemini_auth_path=gemini_auth_path,
+                query_plan=query_plan,
+                initial_budget_warning_reported=initial_query_fit.modified,
+                initial_seen_pmids=initial_seen_pmids,
+                on_round=process_round,
+            )
+
+        write_continuation_state(
+            continuation_state_path,
+            status=search_result.stop_reason,
+            current_query=search_result.final_query,
+            completed_pmids=completed_pmids,
+            rounds_completed=search_result.rounds_completed,
+            max_rounds_exhausted=search_result.max_rounds_exhausted,
+            query_plan=query_plan,
+            counts=counts,
+        )
+        screenable_articles = search_result.screenable_articles
+        missing_pmids = search_result.missing_pmids
+        llm_selection = search_result.gemini_selection
+        if missing_pmids:
+            print(
+                f"Warning: PubMed omitted metadata for {len(missing_pmids)} "
+                "requested record(s).",
+                flush=True,
+            )
+        write_llm_report(
+            llm_report_path,
+            llm_selection,
+            screenable_articles,
+            query_rounds=search_result.query_rounds,
+            automatically_applied_exclusions=(
+                search_result.automatically_applied_exclusions
+            ),
+            query_plan=query_plan,
+        )
+        if llm_selection.fallback:
+            print(
+                f"{active_provider_label} failed or was unavailable for at "
+                "least one batch; "
+                "affected candidates were approved by the fail-open policy.",
+                flush=True,
+            )
+        else:
+            print(
+                f"{active_provider_label} approved "
+                f"{len(llm_selection.approved_pmids):,}/"
+                f"{len(screenable_articles):,} length-possible candidate(s).",
+                flush=True,
+            )
+
+        print(
+            "Finished: "
+            f"{search_result.rounds_completed}/{args.max_rounds} completed "
+            "round(s), "
+            f"{counts['considered']} PubMed record(s) scanned, "
+            f"{counts['metadata_short']} skipped from pagination, "
+            f"{counts['screened']} sent to {active_provider_label}, "
+            f"{counts['attempted']} PDF download attempt(s), "
+            f"{counts['tries']}/{args.max_tries} qualifying-length outcome(s), "
+            f"{counts['downloaded']} downloaded, "
+            f"{counts['existing']} already present, "
+            f"{counts['metadata_missing']} metadata failure(s), "
+            f"{counts['failed']} genuine download failure(s), "
+            f"{counts['pdf_short']} verified-short PDF(s), "
+            f"{counts['screening_rejected']} "
+            f"{active_provider_label}-rejected, "
+            f"{counts['limit_skipped']} skipped after a stop limit.",
+            flush=True,
+        )
+        print(f"Stop reason: {search_result.stop_reason}.", flush=True)
+        if llm_selection.suggested_exclusions:
+            suggested_value = ",".join(llm_selection.suggested_exclusions)
+            print(
+                f"{active_provider_label} suggested future title exclusions: "
+                + ", ".join(llm_selection.suggested_exclusions),
+                flush=True,
+            )
+            print(
+                f"Copy-paste option: --exclude {json.dumps(suggested_value)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"{active_provider_label} suggested no additional title "
+                "exclusions for this run.",
+                flush=True,
+            )
+        if search_result.automatically_applied_exclusions:
+            print(
+                "Automatically applied during later PubMed rounds: "
+                + ", ".join(search_result.automatically_applied_exclusions),
+                flush=True,
+            )
+        else:
+            print(
+                "No LLM exclusions were automatically applied.",
+                flush=True,
+            )
+        print(f"Success list: {success_path}", flush=True)
+        print(f"Failure list: {failure_path}", flush=True)
+        print(f"Metadata: {metadata_path}", flush=True)
+        print(f"LLM report: {llm_report_path}", flush=True)
+        print(f"Continuation state: {continuation_state_path}", flush=True)
+        if search_result.max_rounds_exhausted:
+            resume_command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--resume-from",
+                str(continuation_state_path),
+                "--continuation-state",
+                str(continuation_state_path),
+                "--output-dir",
+                str(output_dir),
+                "--max-rounds",
+                str(args.max_rounds),
+                "--max-tries",
+                str(args.max_tries),
+                "--max-articles",
+                str(args.max_articles),
+                "--min-length",
+                str(args.min_length),
+                "--max-age",
+                str(args.max_age),
+                "--max-query-length",
+                str(args.max_query_length),
+                "--failure-list",
+                str(failure_path),
+                "--success-list",
+                str(success_path),
+                "--metadata",
+                str(metadata_path),
+                "--gemini-auth",
+                str(gemini_auth_path),
+                "--gemini-model",
+                args.gemini_model,
+                "--gemini-location",
+                args.gemini_location,
+                "--llm-report",
+                str(llm_report_path),
+                "--retries",
+                str(args.retries),
+                "--timeout",
+                str(args.timeout),
+            ]
+            if args.openai_model:
+                resume_command.extend(
+                    ["--openai-model", args.openai_model]
+                )
+            if args.pmc_only:
+                resume_command.append("--pmc-only")
+            print(
+                f"Maximum number of rounds exhausted: "
+                f"--max-rounds={args.max_rounds}.",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                f"Current continuation query: {search_result.final_query}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                "Relaunch with the checkpoint below to use that query without "
+                "re-screening completed PMIDs:",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                "  " + " ".join(shlex.quote(part) for part in resume_command),
+                file=sys.stderr,
+                flush=True,
+            )
+        return 0
+    finally:
+        browser.close()
+        client.close()
+
+
+def make_temp_pdf_path(output_dir: Path) -> Path:
+    handle = tempfile.NamedTemporaryFile(
+        prefix=".PubMedley_",
+        suffix=".pdf",
+        dir=output_dir,
+        delete=False,
+    )
+    path = Path(handle.name)
+    handle.close()
+    return path
+
+
+def element_text(element: ET.Element | None) -> str:
+    if element is None:
+        return ""
+    return normalize_space("".join(element.itertext()))
+
+
+def unique_text(elements: Iterable[ET.Element]) -> list[str]:
+    return list(
+        dict.fromkeys(text for element in elements if (text := element_text(element)))
+    )
+
+
+def normalize_space(value: str) -> str:
+    return " ".join(value.split())
+
+
+def clean_list_field(value: str) -> str:
+    return normalize_space(str(value).replace("\t", " ").replace("\n", " "))
+
+
+def truncate(value: str, length: int) -> str:
+    return value if len(value) <= length else value[: max(1, length - 1)] + "…"
+
+
+def compact_error(error: BaseException) -> str:
+    return normalize_space(str(error)) or error.__class__.__name__
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
+def parse_content_length(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        return run(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted; completed output rows were flushed.", file=sys.stderr)
+        return 130
+    except (PubMedleyError, OSError) as exc:
+        print(f"Fatal error: {compact_error(exc)}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
