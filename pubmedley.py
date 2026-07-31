@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find and download long, free PubMed reviews.
+"""Find and download PubMed articles.
 
 The search is performed against PubMed with relevance sorting.  PubMed does not
 provide a dependable page count, so every candidate PDF is downloaded to a
@@ -4658,7 +4658,7 @@ def run(args: argparse.Namespace) -> int:
         retries=args.retries,
         timeout=args.timeout,
         email=args.email,
-        api_key=args.api_key,
+        api_key=args.ncbi_api_key,
     )
     browser = BrowserPdfDownloader(timeout=args.timeout, retries=args.retries)
     try:
