@@ -1,9 +1,16 @@
 # Executable example for:
-#   python sources/pull_sources.py --query-yaml sources/example_query.yaml
+#   python sources/pubmedley.py --query-yaml sources/example_query.yaml
 #
 # This example searches for comprehensive human reviews about sleep and memory.
 # Boolean operators may be nested to any depth. A plain string or `raw:` value
 # is passed through as PubMed syntax.
+
+# Optional plain-language research objective. PubMedley gives this to the LLM
+# together with the exact compiled query. --explanation overrides this value.
+# If both are omitted, the objective is inferred from the compiled query.
+explanation: >-
+  Comprehensive reviews explaining how sleep affects human memory and cognition,
+  including mechanisms, competing models, and major areas of agreement.
 
 query:
   AND:
@@ -58,6 +65,8 @@ filters:
   full_text: false
   has_abstract: true
   humans: true
+  # Set true to require availability in PubMed Central.
+  pmc: false
   language:
     - English
   publication_date:
@@ -66,7 +75,8 @@ filters:
     current: "{current:%Y/%m/%d}"
 
 # Set true only when reusing the built-in human-intelligence title exclusions.
-# User --exclude terms and safe Gemini suggestions are incorporated regardless.
+# User --exclude terms are incorporated regardless. LLMs propose a complete
+# improved query rather than a list of exclusion phrases.
 use_default_exclusions: false
 
 # Optional structured exclusions. A raw string is also accepted, including:
@@ -79,7 +89,7 @@ exclusion_query:
     - mesh_terms:
         - Animals
 
-# Optional Gemini screening profile. If this entire section is omitted, the
+# Optional LLM screening profile. If this entire section is omitted, the
 # script intelligently derives screening instructions from the compiled query.
 screening:
   objective: >-
