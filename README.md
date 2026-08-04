@@ -20,7 +20,7 @@ Single call pipeline to:
 
 ## Parameters
 ### Basic information and config
-* `--email` - specify an email that will be used with NCBI queries. No need to pre-register or anything just helps.
+* `--email` - specify an email used with NCBI queries and the Unpaywall API. No registration is required.
 * `--gemini-auth` - location of service account JSON file, default is 'gemini_service_account.json'
 * `--gemini-model` - only accepts gemini models 3.1 and later, default 'gemini-3.6-flash'
 * `--openai-model` - Overrides Gemini setting to use OpenAI API instead
@@ -31,6 +31,9 @@ Single call pipeline to:
 * `--llm-retries 3` - LLM retries after the initial call, with 1, 2, and 4 second waits by default
 * `--timeout 60` - seconds
 * `--ncbi-api-key <NCBI_API_KEY>` - not required but allows for faster throughput
+* `S2_API_KEY` environment variable - optional Semantic Scholar API key; anonymous lookups are supported but share a public rate limit
+* `ELSEVIER_API_KEY` environment variable - optional Elsevier developer key used with the official Article Retrieval API when an Elsevier PII/DOI is present
+  * `ELSEVIER_INST_TOKEN` is also honored when your institution supplies one; neither credential is ever put in output URLs or metadata
 * `--max-articles 20` - maximum number of files you want downloaded at the end
 * `--max-tries 100` - Maximum number of qualifying-length download outcomes.
   * For example, say you want 20 files, to prevent it from running forever if it keeps failing to download, set this for how many it will try before giving up.
@@ -49,7 +52,8 @@ Single call pipeline to:
   * `--llm-report llm_screening.json` - info about the LLM call results
 * Interactive terminal output uses color for quick scanning:
   * query text is cyan, successful downloads are green, browser failure/retry markers are maroon, and raw browser diagnostics are gray
-  * every completed round ends with a purple per-round summary of PubMed hits, LLM and length rejections, download failures/successes, remaining requested articles, and remaining rounds
+  * every completed round ends with a purple funnel summary that distinguishes total PubMed matches from IDs examined, previously seen records, unseen records selected, metadata outcomes, LLM outcomes, PDF attempts, remaining requested articles, and remaining rounds
+  * query-refinement-only rounds are labelled explicitly; they do not print an empty candidate progress bar
   * ANSI colors are automatically omitted when output is redirected to a file
 
 ### Query
@@ -103,13 +107,20 @@ Single call pipeline to:
   * After retry exhaustion PubMedley stops before downloading that batch and explicitly suggests `--no-llm`
   * With explicit `--no-llm`, hard title exclusions still apply locally but semantic relevance filtering and adaptive query rewrites are disabled
 6. Check for existing PDF (If article has already been downloaded skip)
-7. For PMC articles, try the current anonymous PMC AWS Open Data PDF route
-8. Try legacy PMC OA, PMC page/canonical, and publisher HTTP routes
-9. If unable to download PDF, use headless Chromium browser
+7. For PMC articles, try the current anonymous PMC AWS Open Data route, legacy PMC OA service, and PMC page/canonical routes
+8. For recognized Elsevier records, use the official Article Retrieval API when `ELSEVIER_API_KEY` is configured
+9. Ask Unpaywall (when `--email` is configured) and Semantic Scholar for explicit legal open-access PDF locations, preferring repository copies that avoid publisher bot walls
+10. Try the DOI publisher page and any PDF links it exposes over HTTP
+11. If unable to download PDF, use headless Chrome/Chromium
   * Will visit up to 12 pages in an attempt to download the PDF
-10. Repeat search-download steps until a configured limit is reached or the expanded/configured PubMed search space is genuinely exhausted
+  * Prefers an installed Google Chrome and falls back to Playwright Chromium
+  * Uses PMC/DOI landing pages without redundantly opening PubMed in the browser; PubMed remains the fallback for records with neither identifier
+  * Tries stable provider routes both as browser-context requests and real top-level navigations
+  * Retries transient failures such as HTTP 429, but stops immediately when every discovered PDF route is deterministically rejected (for example HTTP 403)
+12. Repeat search-download steps until a configured limit is reached or the expanded/configured PubMed search space is genuinely exhausted
 
 ## PDF retrieval
 * PMC is removing legacy FTP/OA PDF structure in August 2026
   * New method is AWS Open Data service for programmatic PDF retrieval
-* Code currently supports both and uses headless Chromium as a final backup
+* Code currently supports both, supplements them with Unpaywall and Semantic Scholar OA locations, and uses headless Chrome/Chromium as a final backup
+* `pypdf` runs in repair-friendly mode for page counting. The repetitive duplicate-dictionary `/MediaBox` warning from malformed-but-readable PDFs is suppressed; actual parser failures are still reported.

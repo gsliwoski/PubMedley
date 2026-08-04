@@ -33,6 +33,7 @@ import argparse
 import csv
 import html
 import json
+import logging
 import os
 import re
 import shlex
@@ -48,7 +49,15 @@ from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, quote_plus, urljoin, urlparse, urlunparse
+from urllib.parse import (
+    parse_qsl,
+    quote,
+    quote_plus,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
 
 try:
     import requests
@@ -65,6 +74,10 @@ EUTILS_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 PMC_OA_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
 PMC_ARTICLE_BASE_URL = "https://pmc.ncbi.nlm.nih.gov/articles"
 PMC_AWS_BASE_URL = "https://pmc-oa-opendata.s3.amazonaws.com"
+SEMANTIC_SCHOLAR_PAPER_URL = (
+    "https://api.semanticscholar.org/graph/v1/paper"
+)
+UNPAYWALL_API_URL = "https://api.unpaywall.org/v2"
 TOOL_NAME = "PubMedley"
 USER_AGENT_VERSION = "1.0"
 EFETCH_BATCH_SIZE = 200
@@ -90,6 +103,8 @@ DEFAULT_GEMINI_LOCATION = "global"
 BROWSER_MAX_PAGES_PER_ARTICLE = 12
 BROWSER_MAX_CLICK_TARGETS = 8
 BROWSER_MAX_DIAGNOSTIC_EVENTS = 100
+BROWSER_NCBI_NAVIGATION_INTERVAL = 0.5
+BROWSER_PUBLISHER_SETTLE_MS = 5_000
 MINIMUM_GEMINI_MODEL_VERSION = (3, 1)
 GEMINI_MODEL_VERSION_RE = re.compile(
     r"(?:^|/)gemini-(\d+)\.(\d+)(?=$|[-.@])",
@@ -110,6 +125,15 @@ ANSI_PURPLE = "35"
 ANSI_GRAY = "90"
 # XTerm 256-colour maroon. Modern macOS/Linux terminals support this sequence.
 ANSI_MAROON = "38;5;88"
+
+
+class PypdfRepairNoiseFilter(logging.Filter):
+    """Hide one noisy strict=False repair warning while retaining real errors."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith(
+            "Multiple definitions in dictionary at byte "
+        )
 
 
 def terminal_supports_color(stream: Any) -> bool:
@@ -158,7 +182,13 @@ def style_browser_failure_diagnostics(message: str, *, stream: Any) -> str:
         code = (
             ANSI_MAROON
             if normalized.startswith(
-                ("[browser failed", "retry ", "retrying ", "no browser retries")
+                (
+                    "[browser failed",
+                    "retry ",
+                    "retrying ",
+                    "not retrying",
+                    "no browser retries",
+                )
             )
             else ANSI_GRAY
         )
@@ -351,8 +381,10 @@ class BrowserDownloadFailed(PubMedleyError):
         message: str,
         *,
         diagnostics: Sequence[Mapping[str, Any]] = (),
+        retryable: bool = True,
     ) -> None:
         self.diagnostics = [dict(item) for item in diagnostics]
+        self.retryable = retryable
         super().__init__(message)
 
 
@@ -415,6 +447,7 @@ class PdfCandidate:
 
     url: str
     source: str
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -3912,6 +3945,11 @@ def print_round_statistics(
     *,
     round_number: int,
     pubmed_total_hits: int,
+    pubmed_ids_examined: int,
+    previously_seen_pmids: int,
+    selected_new_pmids: int,
+    metadata_records: int,
+    query_refinement_only: bool,
     counts_before: Mapping[str, int],
     counts_after: Mapping[str, int],
     args: argparse.Namespace,
@@ -3930,18 +3968,42 @@ def print_round_statistics(
         args.max_articles - int(counts_after.get("downloaded", 0)),
     )
     rounds_remaining = max(0, args.max_rounds - round_number)
-    message = "\n".join(
+    unseen_examined = max(0, pubmed_ids_examined - previously_seen_pmids)
+    deferred_unseen = max(0, unseen_examined - selected_new_pmids)
+    screened = delta("screened")
+    llm_rejected = delta("screening_rejected")
+    lines = [f"[ROUND {round_number} STATISTICS]"]
+    if query_refinement_only:
+        lines.append("  Round mode: query refinement only; no articles processed")
+    lines.extend(
         (
-            f"[ROUND {round_number} STATISTICS]",
-            f"  PubMed query returned: {pubmed_total_hits:,}",
-            f"  Rejected by LLM: {delta('screening_rejected'):,}",
+            f"  PubMed total matches for query: {pubmed_total_hits:,}",
+            f"  PubMed IDs examined: {pubmed_ids_examined:,}",
+            f"  Previously seen and skipped: {previously_seen_pmids:,}",
+            f"  New unseen records selected: {selected_new_pmids:,}",
+        )
+    )
+    if deferred_unseen:
+        lines.append(
+            f"  Unseen records deferred to later rounds: {deferred_unseen:,}"
+        )
+    lines.extend(
+        (
+            f"  Metadata records loaded: {metadata_records:,}",
+            f"  Metadata failures: {delta('metadata_missing'):,}",
+            f"  Rejected by local title filters: {delta('title_excluded'):,}",
             f"  Rejected for length: {rejected_for_length:,}",
+            f"  Sent to LLM: {screened:,}",
+            f"  Rejected by LLM: {llm_rejected:,}",
+            f"  Eligible after LLM: {max(0, screened - llm_rejected):,}",
+            f"  PDF download attempts: {delta('attempted'):,}",
             f"  Failed to download: {delta('failed'):,}",
             f"  Successfully downloaded: {delta('downloaded'):,}",
             f"  Requested articles left to download: {downloads_remaining:,}",
             f"  Potential rounds remaining: {rounds_remaining:,}",
         )
     )
+    message = "\n".join(lines)
     tqdm.write(
         terminal_style(message, ANSI_PURPLE, stream=sys.stdout),
         file=sys.stdout,
@@ -4074,6 +4136,38 @@ def discover_pdf_candidates(
             )
         )
 
+    elsevier_candidate, elsevier_metadata = discover_elsevier_api_candidate(article)
+    discovery_metadata["elsevier_article_api"] = elsevier_metadata
+    if elsevier_candidate is not None:
+        candidates.append(elsevier_candidate)
+
+    # DOI/publisher pages routinely hide their PDF behind JavaScript or bot
+    # challenges. Ask legal OA indexes for explicit PDF locations before
+    # falling back to page scraping and Chromium.
+    if article.doi and getattr(client, "email", None):
+        try:
+            unpaywall_candidates, unpaywall_metadata = (
+                discover_unpaywall_links(client, article.doi)
+            )
+            candidates.extend(unpaywall_candidates)
+            discovery_metadata["unpaywall"] = unpaywall_metadata
+        except PubMedleyError as exc:
+            errors.append(f"Unpaywall lookup: {compact_error(exc)}")
+    elif article.doi:
+        discovery_metadata["unpaywall"] = {
+            "attempted": False,
+            "reason": "--email/NCBI_EMAIL is required by the Unpaywall API",
+        }
+
+    try:
+        semantic_candidates, semantic_metadata = (
+            discover_semantic_scholar_links(client, article)
+        )
+        candidates.extend(semantic_candidates)
+        discovery_metadata["semantic_scholar"] = semantic_metadata
+    except PubMedleyError as exc:
+        errors.append(f"Semantic Scholar lookup: {compact_error(exc)}")
+
     if article.doi:
         doi_url = f"https://doi.org/{quote(article.doi, safe='/():;')}"
         try:
@@ -4102,6 +4196,189 @@ def discover_pdf_candidates(
             errors.append(f"PubMed page lookup: {compact_error(exc)}")
 
     return deduplicate_candidates(candidates), discovery_metadata, errors
+
+
+def discover_elsevier_api_candidate(
+    article: Article,
+) -> tuple[PdfCandidate | None, dict[str, Any]]:
+    """Build an authenticated official Elsevier PDF candidate when configured."""
+
+    api_key = os.environ.get("ELSEVIER_API_KEY", "").strip()
+    if not api_key:
+        return None, {
+            "configured": False,
+            "reason": "ELSEVIER_API_KEY is not set",
+        }
+    raw_pii = article.identifiers.get("pii", "")
+    pii = re.sub(r"[^A-Za-z0-9]", "", raw_pii).upper()
+    if pii and re.fullmatch(r"S[A-Z0-9]{10,}", pii):
+        endpoint = f"https://api.elsevier.com/content/article/pii/{pii}"
+        identifier_type = "pii"
+    elif article.doi and article.doi.casefold().startswith("10.1016/"):
+        endpoint = (
+            "https://api.elsevier.com/content/article/doi/"
+            f"{quote(article.doi, safe='')}"
+        )
+        identifier_type = "doi"
+    else:
+        return None, {
+            "configured": True,
+            "applicable": False,
+            "reason": "the article has no recognizable Elsevier PII/DOI",
+        }
+
+    headers = {
+        "Accept": "application/pdf",
+        "X-ELS-APIKey": api_key,
+    }
+    institution_token = os.environ.get("ELSEVIER_INST_TOKEN", "").strip()
+    if institution_token:
+        headers["X-ELS-Insttoken"] = institution_token
+    return (
+        PdfCandidate(
+            url=f"{endpoint}?amsRedirect=true",
+            source="Elsevier Article Retrieval API PDF",
+            headers=headers,
+        ),
+        {
+            "configured": True,
+            "applicable": True,
+            "identifier_type": identifier_type,
+            "institution_token_configured": bool(institution_token),
+        },
+    )
+
+
+def discover_unpaywall_links(
+    client: HttpClient,
+    doi: str,
+) -> tuple[list[PdfCandidate], dict[str, Any]]:
+    """Return legal OA PDF locations reported by Unpaywall."""
+
+    if not client.email:
+        raise PubMedleyError(
+            "--email/NCBI_EMAIL is required by the Unpaywall API"
+        )
+    endpoint = f"{UNPAYWALL_API_URL}/{quote(doi, safe='/():;')}"
+    response = client.request(
+        "GET",
+        endpoint,
+        params={"email": client.email},
+    )
+    try:
+        payload = response.json()
+    except (ValueError, requests.JSONDecodeError) as exc:
+        raise PubMedleyError(
+            f"Unpaywall returned invalid JSON: {compact_error(exc)}"
+        ) from exc
+    finally:
+        response.close()
+    if not isinstance(payload, Mapping):
+        raise PubMedleyError("Unpaywall returned a non-object response")
+
+    raw_locations: list[Mapping[str, Any]] = []
+    best = payload.get("best_oa_location")
+    if isinstance(best, Mapping):
+        raw_locations.append(best)
+    locations = payload.get("oa_locations")
+    if isinstance(locations, list):
+        raw_locations.extend(
+            location for location in locations if isinstance(location, Mapping)
+        )
+
+    # Repository copies are less likely to be guarded by publisher bot walls.
+    # Preserve Unpaywall's order within each group and validate every download.
+    raw_locations.sort(
+        key=lambda location: (
+            str(location.get("host_type", "")).casefold() != "repository",
+            not bool(location.get("is_best")),
+        )
+    )
+    candidates: list[PdfCandidate] = []
+    for location in raw_locations:
+        pdf_url = normalize_download_url(str(location.get("url_for_pdf") or ""))
+        if not pdf_url:
+            continue
+        host_type = normalize_space(str(location.get("host_type") or "unknown"))
+        version = normalize_space(str(location.get("version") or "unknown version"))
+        candidates.append(
+            PdfCandidate(
+                url=pdf_url,
+                source=f"Unpaywall {host_type} PDF ({version})",
+            )
+        )
+
+    metadata = {
+        "attempted": True,
+        "is_oa": bool(payload.get("is_oa")),
+        "oa_status": payload.get("oa_status"),
+        "has_repository_copy": bool(payload.get("has_repository_copy")),
+        "reported_location_count": len(raw_locations),
+        "pdf_candidate_count": len(deduplicate_candidates(candidates)),
+    }
+    return deduplicate_candidates(candidates), metadata
+
+
+def discover_semantic_scholar_links(
+    client: HttpClient,
+    article: Article,
+) -> tuple[list[PdfCandidate], dict[str, Any]]:
+    """Return Semantic Scholar's explicit public-PDF location for a record."""
+
+    external_id = (
+        f"DOI:{article.doi}" if article.doi else f"PMID:{article.pmid}"
+    )
+    endpoint = f"{SEMANTIC_SCHOLAR_PAPER_URL}/{quote(external_id, safe=':/.')}"
+    headers: dict[str, str] = {}
+    semantic_scholar_key = os.environ.get("S2_API_KEY", "").strip()
+    if semantic_scholar_key:
+        headers["x-api-key"] = semantic_scholar_key
+    response = client.request(
+        "GET",
+        endpoint,
+        params={
+            "fields": "title,isOpenAccess,openAccessPdf,externalIds",
+        },
+        headers=headers or None,
+    )
+    try:
+        payload = response.json()
+    except (ValueError, requests.JSONDecodeError) as exc:
+        raise PubMedleyError(
+            "Semantic Scholar returned invalid JSON: "
+            f"{compact_error(exc)}"
+        ) from exc
+    finally:
+        response.close()
+    if not isinstance(payload, Mapping):
+        raise PubMedleyError("Semantic Scholar returned a non-object response")
+
+    open_pdf = payload.get("openAccessPdf")
+    pdf_url = ""
+    pdf_status = None
+    pdf_license = None
+    if isinstance(open_pdf, Mapping):
+        pdf_url = normalize_download_url(str(open_pdf.get("url") or ""))
+        pdf_status = open_pdf.get("status")
+        pdf_license = open_pdf.get("license")
+    candidates = (
+        [
+            PdfCandidate(
+                url=pdf_url,
+                source="Semantic Scholar open-access PDF",
+            )
+        ]
+        if pdf_url
+        else []
+    )
+    return candidates, {
+        "attempted": True,
+        "paper_id": payload.get("paperId"),
+        "is_open_access": bool(payload.get("isOpenAccess")),
+        "pdf_status": pdf_status,
+        "pdf_license": pdf_license,
+        "pdf_candidate_count": len(candidates),
+    }
 
 
 def discover_pmc_aws_links(
@@ -4288,7 +4565,13 @@ def deduplicate_candidates(
         if not url or url in seen:
             continue
         seen.add(url)
-        unique.append(PdfCandidate(url=url, source=candidate.source))
+        unique.append(
+            PdfCandidate(
+                url=url,
+                source=candidate.source,
+                headers=dict(candidate.headers),
+            )
+        )
     return unique
 
 
@@ -4299,6 +4582,88 @@ def normalize_download_url(url: str) -> str:
     if parsed.scheme not in {"http", "https"}:
         return ""
     return urlunparse(parsed)
+
+
+def browser_url_identity(url: str) -> str:
+    """Normalize harmless tracking differences for browser queue deduplication."""
+
+    normalized = normalize_download_url(url)
+    if not normalized:
+        return ""
+    parsed = urlparse(normalized)
+    ignored_query_names = {
+        "via",
+        "viadihub",
+        "utm_campaign",
+        "utm_content",
+        "utm_medium",
+        "utm_source",
+        "utm_term",
+    }
+    query = urlencode(
+        [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.casefold() not in ignored_query_names
+        ],
+        doseq=True,
+    )
+    return urlunparse(
+        parsed._replace(
+            netloc=parsed.netloc.casefold(),
+            path=parsed.path.rstrip("/") or "/",
+            query=query,
+            fragment="",
+        )
+    )
+
+
+def elsevier_pii_from_url(url: str) -> str | None:
+    """Extract a normalized Elsevier PII from linkinghub/ScienceDirect URLs."""
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    if not (
+        host.endswith("sciencedirect.com")
+        or host.endswith("linkinghub.elsevier.com")
+    ):
+        return None
+    match = re.search(r"/(?:pii|retrieve/pii)/([^/?#]+)", parsed.path, re.I)
+    if match is None:
+        return None
+    pii = re.sub(r"[^A-Za-z0-9]", "", match.group(1)).upper()
+    return pii if re.fullmatch(r"S[A-Z0-9]{10,}", pii) else None
+
+
+def elsevier_pdf_urls(
+    url: str,
+    *,
+    fallback_pii: str | None = None,
+) -> list[str]:
+    """Build public ScienceDirect PDF routes from a normalized Elsevier PII."""
+
+    pii = elsevier_pii_from_url(url)
+    host = (urlparse(url).hostname or "").casefold()
+    is_elsevier_page = (
+        host.endswith("sciencedirect.com")
+        or host.endswith("linkinghub.elsevier.com")
+    )
+    if pii is None and fallback_pii and is_elsevier_page:
+        normalized_fallback = re.sub(
+            r"[^A-Za-z0-9]",
+            "",
+            fallback_pii,
+        ).upper()
+        if re.fullmatch(r"S[A-Z0-9]{10,}", normalized_fallback):
+            pii = normalized_fallback
+    if pii is None:
+        return []
+    return [
+        "https://www.sciencedirect.com/science/article/pii/"
+        f"{pii}/pdf",
+        "https://www.sciencedirect.com/science/article/pii/"
+        f"{pii}/pdfft?isDTMRedir=true&download=true"
+    ]
 
 
 def looks_like_pdf_url(url: str) -> bool:
@@ -4321,6 +4686,102 @@ def headers_indicate_pdf(headers: dict[str, str]) -> bool:
     return "application/pdf" in content_type or ".pdf" in disposition
 
 
+def browser_attempt_retry_reason(
+    diagnostics: Mapping[str, Any],
+) -> str | None:
+    """Return why another browser attempt could help, else stop immediately."""
+
+    pages = diagnostics.get("pages", [])
+    requests_made = diagnostics.get("pdf_requests", [])
+    retryable_statuses = [
+        int(status)
+        for status in (
+            [page.get("status") for page in pages]
+            + [request.get("status") for request in requests_made]
+        )
+        if status is not None and int(status) in RETRYABLE_HTTP_STATUSES
+    ]
+    if retryable_statuses:
+        return "transient HTTP status(es): " + ", ".join(
+            str(status) for status in retryable_statuses
+        )
+
+    errors = " ".join(
+        normalize_space(str(error)).casefold()
+        for error in diagnostics.get("errors", [])
+    )
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "name resolution",
+        "net::err_",
+        "temporarily unavailable",
+    )
+    if any(marker in errors for marker in transient_markers):
+        return "transient browser/network error"
+
+    pdf_signal_count = sum(
+        int(page.get("pdf_cue_count", 0))
+        + int(page.get("pdf_controls_matched", 0))
+        for page in pages
+    )
+    network_events = diagnostics.get("pdf_network_events", [])
+    potentially_usable_network_event = any(
+        event.get("status") is None or int(event.get("status")) < 400
+        for event in network_events
+    )
+    request_statuses = [
+        request.get("status")
+        for request in requests_made
+        if request.get("status") is not None
+    ]
+    every_pdf_request_was_definitively_rejected = bool(request_statuses) and all(
+        int(status) >= 400 and int(status) not in RETRYABLE_HTTP_STATUSES
+        for status in request_statuses
+    )
+    if potentially_usable_network_event or (
+        pdf_signal_count and not every_pdf_request_was_definitively_rejected
+    ):
+        return "a PDF route was detected but did not complete"
+    return None
+
+
+def browser_attempt_terminal_reason(
+    diagnostics: Mapping[str, Any],
+) -> str | None:
+    """Explain deterministic publisher failures that another retry cannot fix."""
+
+    pages = diagnostics.get("pages", [])
+    requests_made = diagnostics.get("pdf_requests", [])
+    challenged = any(
+        page.get("page_state") == "blocked_or_challenged" for page in pages
+    )
+    pdf_statuses = [
+        int(request["status"])
+        for request in requests_made
+        if request.get("status") is not None
+    ]
+    every_pdf_route_forbidden = bool(pdf_statuses) and all(
+        status in {401, 403} for status in pdf_statuses
+    )
+    if challenged and every_pdf_route_forbidden:
+        return (
+            "the publisher's access/anti-bot challenge returned HTTP 401/403 "
+            "for every discovered PDF route; repeating headless Chrome will "
+            "not solve it—use a PMC/repository copy or the publisher's "
+            "official API credentials"
+        )
+    if every_pdf_route_forbidden:
+        return (
+            "every discovered PDF route returned HTTP 401/403; use another "
+            "open-access location or publisher API credentials"
+        )
+    return None
+
+
 def browser_attempt_summary(diagnostics: Mapping[str, Any]) -> str:
     """Condense one browser crawl into a useful failure-list explanation."""
 
@@ -4334,6 +4795,12 @@ def browser_attempt_summary(diagnostics: Mapping[str, Any]) -> str:
     full_text_count = sum(
         int(page.get("full_text_links_queued", 0)) for page in pages
     )
+    ignored_linkouts = sum(
+        int(page.get("non_full_text_linkouts_ignored", 0)) for page in pages
+    )
+    duplicate_pages = sum(
+        bool(page.get("duplicate_final_url")) for page in pages
+    )
     matched_controls = sum(
         int(page.get("pdf_controls_matched", 0)) for page in pages
     )
@@ -4342,6 +4809,8 @@ def browser_attempt_summary(diagnostics: Mapping[str, Any]) -> str:
         f"inspected {link_count} link(s)",
         f"found {pdf_cue_count} PDF-link cue(s)",
         f"queued {full_text_count} full-text provider link(s)",
+        f"ignored {ignored_linkouts} non-full-text LinkOut link(s)",
+        f"skipped {duplicate_pages} duplicate redirected page(s)",
         f"matched {matched_controls} PDF control(s)",
         f"made {len(requests_made)} PDF request(s)",
         f"observed {len(network_events)} PDF-like network response(s)",
@@ -4373,6 +4842,16 @@ def browser_attempt_summary(diagnostics: Mapping[str, Any]) -> str:
         parts.append(
             "errors: "
             + "; ".join(truncate(normalize_space(str(error)), 240) for error in errors[-4:])
+        )
+    if diagnostics.get("retry_stop_reason"):
+        parts.append(
+            "retry stopped: "
+            + normalize_space(str(diagnostics["retry_stop_reason"]))
+        )
+    if diagnostics.get("terminal_reason"):
+        parts.append(
+            "terminal cause: "
+            + normalize_space(str(diagnostics["terminal_reason"]))
         )
     if len(visited) >= BROWSER_MAX_PAGES_PER_ARTICLE:
         parts.append(
@@ -4419,9 +4898,15 @@ def format_browser_attempt_diagnostics(
                 f"links={page.get('link_count', 0)}, "
                 f"PDF cues={page.get('pdf_cue_count', 0)}, "
                 f"provider links queued={page.get('full_text_links_queued', 0)}, "
+                "non-full-text LinkOut links ignored="
+                f"{page.get('non_full_text_linkouts_ignored', 0)}, "
                 f"PDF controls={page.get('pdf_controls_matched', 0)}/"
                 f"{page.get('pdf_controls_scanned', 0)} matched"
             )
+            if page.get("duplicate_final_url"):
+                detail += ", duplicate redirected page skipped"
+            if page.get("page_state"):
+                detail += f", page state={page['page_state']}"
             lines.append(
                 f"      {page_number}. {page.get('source', 'browser page')}; "
                 f"{status}; {detail}; "
@@ -4466,6 +4951,12 @@ def format_browser_attempt_diagnostics(
         )
     if retry_delay is not None:
         lines.append(f"    Retrying in {retry_delay:g}s.")
+    elif diagnostics.get("retry_stop_reason"):
+        lines.append(
+            "    Not retrying: "
+            + normalize_space(str(diagnostics["retry_stop_reason"]))
+            + "."
+        )
     else:
         lines.append("    No browser retries remain.")
     return "\n".join(lines)
@@ -4480,6 +4971,7 @@ class BrowserPdfDownloader:
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
+        self._last_ncbi_navigation = 0.0
 
     def close(self) -> None:
         for value in (self._context, self._browser):
@@ -4510,10 +5002,21 @@ class BrowserPdfDownloader:
 
         try:
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(
-                headless=True,
-                args=["--disable-extensions"],
-            )
+            launch_options = {
+                "headless": True,
+                "args": ["--disable-extensions"],
+            }
+            try:
+                # The locally installed Chrome is generally closer to what
+                # publisher sites support than Playwright's testing build.
+                self._browser = self._playwright.chromium.launch(
+                    channel="chrome",
+                    **launch_options,
+                )
+            except Exception:
+                self._browser = self._playwright.chromium.launch(
+                    **launch_options,
+                )
             self._context = self._browser.new_context(
                 accept_downloads=True,
                 user_agent=(
@@ -4533,6 +5036,142 @@ class BrowserPdfDownloader:
                 "`python -m playwright install chromium`: "
                 f"{compact_error(exc)}"
             ) from exc
+
+    def _throttle_browser_navigation(self, url: str) -> None:
+        """Keep top-level PubMed browser requests below the anonymous rate."""
+
+        host = (urlparse(url).hostname or "").casefold()
+        if not (
+            host == "ncbi.nlm.nih.gov" or host.endswith(".ncbi.nlm.nih.gov")
+        ):
+            return
+        elapsed = time.monotonic() - self._last_ncbi_navigation
+        if elapsed < BROWSER_NCBI_NAVIGATION_INTERVAL:
+            time.sleep(BROWSER_NCBI_NAVIGATION_INTERVAL - elapsed)
+        self._last_ncbi_navigation = time.monotonic()
+
+    def _settle_browser_page(self, page: Any) -> None:
+        """Wait for publisher PDF affordances instead of using one blind sleep."""
+
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            return
+        host = (urlparse(page.url).hostname or "").casefold()
+        if host.endswith("ncbi.nlm.nih.gov"):
+            return
+
+        for selector in (
+            'button:has-text("Accept all")',
+            'button:has-text("Accept All")',
+            'button:has-text("Accept cookies")',
+            '#onetrust-accept-btn-handler',
+        ):
+            try:
+                control = page.locator(selector).first
+                if control.count() and control.is_visible(timeout=500):
+                    control.click(timeout=min(self.timeout_ms, 2_000))
+                    page.wait_for_timeout(250)
+                    break
+            except Exception:
+                continue
+
+        readiness_script = """
+            () => {
+              if (document.querySelector(
+                'meta[name="citation_pdf_url"], meta[name="eprints.document_url"]'
+              )) return true;
+              const nodes = document.querySelectorAll(
+                'a, button, [role="button"], [onclick], [data-aa-name], ' +
+                '[data-track], [data-testid]'
+              );
+              return Array.from(nodes).some(node => {
+                const label = [
+                  node.innerText || '',
+                  node.getAttribute('aria-label') || '',
+                  node.getAttribute('title') || '',
+                  node.getAttribute('data-aa-name') || '',
+                  node.getAttribute('data-track') || '',
+                  node.getAttribute('data-testid') || ''
+                ].join(' ');
+                return /(?:view|download|read|open)?\\s*(?:full[- ]?text\\s+)?pdf/i.test(label);
+              });
+            }
+        """
+        try:
+            page.wait_for_function(
+                readiness_script,
+                timeout=min(self.timeout_ms, BROWSER_PUBLISHER_SETTLE_MS),
+            )
+        except Exception:
+            # Absence of a PDF affordance is a diagnostic outcome, not a
+            # navigation exception. The crawler records the resulting shell.
+            pass
+
+    def _browser_page_state(
+        self,
+        page: Any,
+        *,
+        title: str,
+        link_count: int,
+    ) -> str:
+        """Classify challenge pages and suspiciously incomplete JS shells."""
+
+        try:
+            body = normalize_space(
+                page.locator("body").inner_text(timeout=2_000)
+            )[:4_000]
+        except Exception:
+            body = ""
+        searchable = f"{title} {body}".casefold()
+        blocked_markers = (
+            "just a moment",
+            "access denied",
+            "verify you are human",
+            "checking your browser",
+            "captcha",
+            "enable cookies",
+        )
+        if any(marker in searchable for marker in blocked_markers):
+            return "blocked_or_challenged"
+        host = (urlparse(page.url).hostname or "").casefold()
+        if (
+            host.endswith("sciencedirect.com")
+            and title.casefold() == "sciencedirect"
+            and link_count < 15
+        ):
+            return "incomplete_javascript_shell"
+        return "ready"
+
+    def _try_provider_pdf_routes(
+        self,
+        page: Any,
+        article: Article,
+        destination: Path,
+        visited_urls: list[str],
+        request_diagnostics: list[dict[str, Any]],
+    ) -> BrowserPdfResult | None:
+        """Try stable provider-specific PDF routes after cookies are established."""
+
+        for pdf_url in elsevier_pdf_urls(
+            page.url,
+            fallback_pii=article.identifiers.get("pii"),
+        ):
+            try:
+                if self._request_pdf(
+                    pdf_url,
+                    destination,
+                    referer=page.url,
+                    diagnostics=request_diagnostics,
+                ):
+                    return BrowserPdfResult(
+                        url=pdf_url,
+                        source="Playwright Elsevier PII PDF route",
+                        visited_urls=visited_urls,
+                    )
+            except Exception:
+                continue
+        return None
 
     def download(
         self,
@@ -4567,11 +5206,17 @@ class BrowserPdfDownloader:
                 )
                 diagnostics["attempt"] = attempt
                 attempt_diagnostics.append(diagnostics)
-                delay = (
-                    min(2 ** (attempt - 1), 30)
-                    if attempt < total_attempts
-                    else None
-                )
+                should_retry = exc.retryable and attempt < total_attempts
+                delay = min(2 ** (attempt - 1), 30) if should_retry else None
+                if not should_retry and attempt < total_attempts:
+                    diagnostics["retry_stop_reason"] = (
+                        diagnostics.get("terminal_reason")
+                        or (
+                            "the crawl found no transient failure or actionable "
+                            "PDF signal, so repeating the same navigation would "
+                            "not help"
+                        )
+                    )
                 browser_message = format_browser_attempt_diagnostics(
                     article,
                     diagnostics,
@@ -4595,9 +5240,10 @@ class BrowserPdfDownloader:
             else "; ".join(errors)
         )
         raise BrowserDownloadFailed(
-            f"browser exhausted {len(errors)} attempt(s) for PMID "
+            f"browser stopped after {len(errors)} attempt(s) for PMID "
             f"{article.pmid}; last attempt: {final_summary}",
             diagnostics=attempt_diagnostics,
+            retryable=False,
         )
 
     def _download_once(
@@ -4662,14 +5308,26 @@ class BrowserPdfDownloader:
         page.on("download", lambda download: downloads.append(download))
         page.on("response", capture_response)
         queue: deque[tuple[str, str]] = deque(landing_urls)
-        queued = {url for url, _ in queue}
+        queued = {
+            identity
+            for url, _ in queue
+            if (identity := browser_url_identity(url))
+        }
+        visited_request_identities: set[str] = set()
+        processed_final_identities: set[str] = set()
 
         try:
             while queue and len(visited_urls) < BROWSER_MAX_PAGES_PER_ARTICLE:
                 url, source = queue.popleft()
                 normalized = normalize_download_url(url)
-                if not normalized or normalized in visited_urls:
+                requested_identity = browser_url_identity(normalized)
+                if (
+                    not normalized
+                    or not requested_identity
+                    or requested_identity in visited_request_identities
+                ):
                     continue
+                visited_request_identities.add(requested_identity)
                 visited_urls.append(normalized)
                 page_record: dict[str, Any] = {
                     "source": source,
@@ -4681,29 +5339,25 @@ class BrowserPdfDownloader:
                     "pdf_cue_count": 0,
                     "pdf_cues": [],
                     "full_text_links_queued": 0,
+                    "non_full_text_linkouts_ignored": 0,
+                    "duplicate_final_url": False,
+                    "page_state": None,
                     "pdf_controls_scanned": 0,
                     "pdf_controls_matched": 0,
                     "error": None,
                 }
                 diagnostics["pages"].append(page_record)
                 try:
+                    self._throttle_browser_navigation(normalized)
                     response = page.goto(
                         normalized,
                         wait_until="domcontentloaded",
                         timeout=self.timeout_ms,
                     )
-                    page.wait_for_timeout(750)
                     page_record["final_url"] = page.url
                     page_record["status"] = (
                         response.status if response is not None else None
                     )
-                    try:
-                        page_record["title"] = normalize_space(page.title())
-                    except Exception as exc:
-                        record_error(
-                            f"could not read page title for {page.url}: "
-                            f"{compact_error(exc)}"
-                        )
                 except Exception as exc:
                     captured = self._save_first_download(
                         downloads,
@@ -4718,6 +5372,21 @@ class BrowserPdfDownloader:
                     page_record["final_url"] = normalize_download_url(page.url)
                     page_record["error"] = compact_error(exc)
                     continue
+
+                final_identity = browser_url_identity(page.url)
+                if final_identity and final_identity in processed_final_identities:
+                    page_record["duplicate_final_url"] = True
+                    continue
+                if final_identity:
+                    processed_final_identities.add(final_identity)
+                self._settle_browser_page(page)
+                try:
+                    page_record["title"] = normalize_space(page.title())
+                except Exception as exc:
+                    record_error(
+                        f"could not read page title for {page.url}: "
+                        f"{compact_error(exc)}"
+                    )
 
                 captured = self._save_first_download(
                     downloads,
@@ -4741,9 +5410,44 @@ class BrowserPdfDownloader:
                 if captured_response:
                     return finish(captured_response)
 
+                provider_result = None
+                if source != "Elsevier direct PDF navigation":
+                    provider_result = self._try_provider_pdf_routes(
+                        page,
+                        article,
+                        destination,
+                        visited_urls,
+                        diagnostics["pdf_requests"],
+                    )
+                if provider_result:
+                    return finish(provider_result)
+
+                # A browser-context GET can be rejected even when a real
+                # top-level navigation succeeds (or triggers a download).
+                # Queue each stable provider PDF route as an actual page visit.
+                provider_urls = elsevier_pdf_urls(
+                    page.url,
+                    fallback_pii=article.identifiers.get("pii"),
+                )
+                for provider_pdf_url in reversed(provider_urls):
+                    provider_identity = browser_url_identity(provider_pdf_url)
+                    if provider_identity and provider_identity not in queued:
+                        queue.appendleft(
+                            (
+                                provider_pdf_url,
+                                "Elsevier direct PDF navigation",
+                            )
+                        )
+                        queued.add(provider_identity)
+
                 try:
                     links = self._page_links(page)
                     page_record["link_count"] = len(links)
+                    page_record["page_state"] = self._browser_page_state(
+                        page,
+                        title=str(page_record.get("title") or ""),
+                        link_count=len(links),
+                    )
                 except Exception as exc:
                     record_error(
                         f"{source} link inspection {page.url}: {compact_error(exc)}"
@@ -4786,9 +5490,10 @@ class BrowserPdfDownloader:
                             record_error(
                                 f"browser-context request {href}: {compact_error(exc)}"
                             )
-                        if href not in queued:
+                        href_identity = browser_url_identity(href)
+                        if href_identity and href_identity not in queued:
                             queue.appendleft((href, f"{source} PDF link"))
-                            queued.add(href)
+                            queued.add(href_identity)
                         continue
 
                     current_host = (urlparse(page.url).hostname or "").casefold()
@@ -4798,10 +5503,14 @@ class BrowserPdfDownloader:
                     full_text_cue = full_text_cue or bool(
                         FULL_TEXT_ACTION_RE.search(text)
                     )
+                    if is_pubmed and kind == "linkout-other":
+                        page_record["non_full_text_linkouts_ignored"] += 1
+                        continue
                     if is_pubmed and href_host != current_host and full_text_cue:
-                        if href not in queued:
+                        href_identity = browser_url_identity(href)
+                        if href_identity and href_identity not in queued:
                             queue.append((href, "PubMed full-text provider"))
-                            queued.add(href)
+                            queued.add(href_identity)
                             page_record["full_text_links_queued"] += 1
 
                 clicked = self._click_pdf_control(
@@ -4818,13 +5527,21 @@ class BrowserPdfDownloader:
                     return finish(clicked)
 
                 current_url = normalize_download_url(page.url)
-                if current_url and current_url not in queued:
-                    queued.add(current_url)
+                current_identity = browser_url_identity(current_url)
+                if current_identity:
+                    queued.add(current_identity)
             diagnostics["queue_exhausted"] = not queue
+            retry_reason = browser_attempt_retry_reason(diagnostics)
+            diagnostics["retryable"] = retry_reason is not None
+            diagnostics["retry_reason"] = retry_reason
+            diagnostics["terminal_reason"] = browser_attempt_terminal_reason(
+                diagnostics
+            )
             reason = browser_attempt_summary(diagnostics)
             raise BrowserDownloadFailed(
                 reason,
                 diagnostics=[diagnostics],
+                retryable=retry_reason is not None,
             )
         finally:
             try:
@@ -4833,7 +5550,9 @@ class BrowserPdfDownloader:
                 pass
 
     def _landing_urls(self, article: Article) -> list[tuple[str, str]]:
-        urls = [(article.pubmed_url, "PubMed article page")]
+        urls: list[tuple[str, str]] = []
+        if article.pmc_url:
+            urls.append((article.pmc_url, "PMC article page"))
         if article.doi:
             urls.append(
                 (
@@ -4841,8 +5560,12 @@ class BrowserPdfDownloader:
                     "DOI publisher page",
                 )
             )
-        if article.pmc_url:
-            urls.append((article.pmc_url, "PMC article page"))
+        # PubMed browser navigation is heavily rate-limited and adds no PDF
+        # route when the article already has a canonical PMC or DOI landing
+        # page. Keep it only as the last-resort landing page for identifier-poor
+        # records; HTTP/API discovery has already queried PubMed where useful.
+        if not urls:
+            urls.append((article.pubmed_url, "PubMed article page"))
         return urls
 
     def _page_links(self, page: Any) -> list[dict[str, str]]:
@@ -4862,18 +5585,24 @@ class BrowserPdfDownloader:
                   .map(image => image.getAttribute('alt') || '')
                   .join(' ');
                 const fullTextContainer = node.closest(
-                  '.full-text-links-list, .full-text-links, #linkout, ' +
+                  '.full-text-links-list, .full-text-links, ' +
                   '[data-ga-action="Full Text Sources"]'
                 );
+                const otherLinkout = !fullTextContainer && node.closest('#linkout');
                 rows.push({
                   href: node.href || '',
                   text: [
                     node.innerText || '',
                     node.getAttribute('aria-label') || '',
                     node.getAttribute('title') || '',
+                    node.getAttribute('data-aa-name') || '',
+                    node.getAttribute('data-track') || '',
+                    node.getAttribute('data-testid') || '',
                     imageAlt
                   ].join(' ').trim(),
-                  kind: fullTextContainer ? 'fulltext' : 'link'
+                  kind: fullTextContainer
+                    ? 'fulltext'
+                    : (otherLinkout ? 'linkout-other' : 'link')
                 });
               }
               return rows;
@@ -4892,7 +5621,11 @@ class BrowserPdfDownloader:
         request_diagnostics: list[dict[str, Any]],
         page_record: dict[str, Any],
     ) -> BrowserPdfResult | None:
-        controls = page.locator("button, [role='button'], a:not([href])")
+        controls = page.locator(
+            "button, [role='button'], a, [onclick], [data-aa-name], "
+            "[data-track], [data-testid], input[type='button'], "
+            "input[type='submit']"
+        )
         try:
             count = min(controls.count(), 250)
             page_record["pdf_controls_scanned"] = count
@@ -4918,6 +5651,10 @@ class BrowserPdfDownloader:
                             control.inner_text(timeout=1_000),
                             control.get_attribute("aria-label") or "",
                             control.get_attribute("title") or "",
+                            control.get_attribute("value") or "",
+                            control.get_attribute("data-aa-name") or "",
+                            control.get_attribute("data-track") or "",
+                            control.get_attribute("data-testid") or "",
                         )
                     )
                 )
@@ -4952,6 +5689,23 @@ class BrowserPdfDownloader:
                 if captured_response:
                     diagnostic["outcome"] = "captured a PDF network response"
                     return captured_response
+                navigated_url = normalize_download_url(page.url)
+                if (
+                    navigated_url
+                    and navigated_url != diagnostic["page_url"]
+                    and self._request_pdf(
+                        navigated_url,
+                        destination,
+                        referer=diagnostic["page_url"],
+                        diagnostics=request_diagnostics,
+                    )
+                ):
+                    diagnostic["outcome"] = "captured a PDF navigation"
+                    return BrowserPdfResult(
+                        url=navigated_url,
+                        source="Playwright PDF control navigation",
+                        visited_urls=visited_urls,
+                    )
                 popup_count = 0
                 for popup in set(self._context.pages) - before_pages:
                     popup_count += 1
@@ -5181,6 +5935,7 @@ def download_pdf_once(
         candidate.url,
         stream=True,
         allow_redirects=True,
+        headers=candidate.headers or None,
     )
     total_header = response.headers.get("Content-Length")
     try:
@@ -5243,6 +5998,9 @@ def download_pdf_once(
 
 
 def pdf_page_count(path: Path) -> int:
+    pypdf_logger = logging.getLogger("pypdf.generic._data_structures")
+    repair_filter = PypdfRepairNoiseFilter()
+    pypdf_logger.addFilter(repair_filter)
     try:
         reader = PdfReader(str(path), strict=False)
         if reader.is_encrypted and reader.decrypt("") == 0:
@@ -5252,6 +6010,8 @@ def pdf_page_count(path: Path) -> int:
         raise
     except Exception as exc:
         raise InvalidPdf(f"PDF parser rejected the file: {compact_error(exc)}") from exc
+    finally:
+        pypdf_logger.removeFilter(repair_filter)
     if count < 1:
         raise InvalidPdf("PDF contains no pages")
     return count
@@ -5609,6 +6369,14 @@ def collect_candidates_with_feedback(
                 continue
             break
 
+        pubmed_ids_examined = len(pmids)
+        previously_seen_pmids = sum(pmid in seen_pmids for pmid in pmids)
+        unseen_pmids_examined = pubmed_ids_examined - previously_seen_pmids
+        deferred_unseen_pmids = max(
+            0,
+            unseen_pmids_examined - len(new_pmids),
+        )
+
         if not new_pmids:
             current_query_exhausted = total_hits <= len(pmids)
             search_context = build_adaptive_search_context(
@@ -5684,6 +6452,11 @@ def collect_candidates_with_feedback(
                 "round": round_number,
                 "query": query,
                 "pubmed_total_hits": total_hits,
+                "pubmed_ids_examined": pubmed_ids_examined,
+                "previously_seen_pmids": previously_seen_pmids,
+                "unseen_pmids_examined": unseen_pmids_examined,
+                "selected_new_pmids": 0,
+                "deferred_unseen_pmids": deferred_unseen_pmids,
                 "requested_results": search_limit,
                 "new_pmids": 0,
                 "metadata_records": 0,
@@ -5761,6 +6534,11 @@ def collect_candidates_with_feedback(
                 print_round_statistics(
                     round_number=round_number,
                     pubmed_total_hits=total_hits,
+                    pubmed_ids_examined=pubmed_ids_examined,
+                    previously_seen_pmids=previously_seen_pmids,
+                    selected_new_pmids=0,
+                    metadata_records=0,
+                    query_refinement_only=True,
                     counts_before=counts_before_round,
                     counts_after=progress_counts or {},
                     args=args,
@@ -5900,6 +6678,11 @@ def collect_candidates_with_feedback(
             "round": round_number,
             "query": query,
             "pubmed_total_hits": total_hits,
+            "pubmed_ids_examined": pubmed_ids_examined,
+            "previously_seen_pmids": previously_seen_pmids,
+            "unseen_pmids_examined": unseen_pmids_examined,
+            "selected_new_pmids": len(new_pmids),
+            "deferred_unseen_pmids": deferred_unseen_pmids,
             "requested_results": search_limit,
             "new_pmids": len(new_pmids),
             "metadata_records": len(articles),
@@ -6006,6 +6789,11 @@ def collect_candidates_with_feedback(
             print_round_statistics(
                 round_number=round_number,
                 pubmed_total_hits=total_hits,
+                pubmed_ids_examined=pubmed_ids_examined,
+                previously_seen_pmids=previously_seen_pmids,
+                selected_new_pmids=len(new_pmids),
+                metadata_records=len(articles),
+                query_refinement_only=False,
                 counts_before=counts_before_round,
                 counts_after=progress_counts or {},
                 args=args,
@@ -6115,12 +6903,17 @@ def process_candidate_round(
         counts["metadata_missing"] += 1
         completed_pmids.add(pmid)
 
-    for article in tqdm(
-        articles,
-        desc=f"Round {candidate_round.round_number} candidates",
-        unit="article",
-        file=sys.stdout,
-    ):
+    article_progress: Iterable[Article]
+    if articles:
+        article_progress = tqdm(
+            articles,
+            desc=f"Round {candidate_round.round_number} candidates",
+            unit="article",
+            file=sys.stdout,
+        )
+    else:
+        article_progress = ()
+    for article in article_progress:
         metadata = article_metadata(article, candidate_round.query)
         metadata["search_round"] = candidate_round.round_number
         metadata["query_mode"] = query_plan.mode
