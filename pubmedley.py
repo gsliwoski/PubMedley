@@ -18,9 +18,9 @@ The active query and ``--explanation`` are included in the screening prompt;
 the LLM returns a complete next-round query which is guardrailed and preflighted
 against PubMed before use.
 PDF discovery first tries the current PubMed Central (PMC) AWS Open Data
-service, then legacy PMC and publisher routes. A persistent headless Chromium
-session follows full-text links and activates PDF downloads when direct HTTP
-discovery is insufficient.
+service, then Europe PMC's reported free-PDF URLs, legacy PMC, and publisher
+routes. A persistent headless Chromium session follows full-text links and
+activates PDF downloads when direct HTTP discovery is insufficient.
 
 NCBI recommends identifying API clients.  Set ``NCBI_EMAIL`` and, optionally,
 ``NCBI_API_KEY`` in the environment.  The script observes NCBI's lower anonymous
@@ -74,6 +74,9 @@ EUTILS_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 PMC_OA_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
 PMC_ARTICLE_BASE_URL = "https://pmc.ncbi.nlm.nih.gov/articles"
 PMC_AWS_BASE_URL = "https://pmc-oa-opendata.s3.amazonaws.com"
+EUROPE_PMC_SEARCH_URL = (
+    "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+)
 SEMANTIC_SCHOLAR_PAPER_URL = (
     "https://api.semanticscholar.org/graph/v1/paper"
 )
@@ -2242,8 +2245,24 @@ def validate_llm_improved_query(
             None,
             "the proposed query has unbalanced quotes, brackets, or parentheses",
         )
-    encoded_length = encoded_query_length(proposed)
     acceptance_status = "accepted"
+    missing_exclusions = [
+        term
+        for term in required_title_exclusions
+        if query_has_title_term(current_query, term)
+        and not query_has_title_term(proposed, term)
+    ]
+    if missing_exclusions:
+        restored_clause = " OR ".join(
+            pubmed_title_clause(term) for term in missing_exclusions
+        )
+        proposed = f"({proposed}) AND NOT ({restored_clause})"
+        acceptance_status = (
+            "accepted after restoring "
+            f"{len(missing_exclusions)} mandatory title filter(s)"
+        )
+
+    encoded_length = encoded_query_length(proposed)
     if encoded_length > max_query_length:
         fitted = fit_pubmed_query(proposed, max_query_length)
         if fitted.encoded_length > max_query_length:
@@ -2254,10 +2273,15 @@ def validate_llm_improved_query(
                 f"{max_query_length:,}",
             )
         proposed = fitted.query
-        acceptance_status = (
-            "accepted after safe compaction"
+        budget_status = (
+            "safe compaction"
             if fitted.compacted and not fitted.removed_alternatives
-            else "accepted after safe compaction/truncation"
+            else "safe compaction/truncation"
+        )
+        acceptance_status = (
+            f"{acceptance_status} and {budget_status}"
+            if acceptance_status != "accepted"
+            else f"accepted after {budget_status}"
         )
     if query_has_free_full_text_filter(
         current_query
@@ -2274,17 +2298,17 @@ def validate_llm_improved_query(
         proposed
     ):
         return None, "the proposed query dropped the review/publication-type constraint"
-    missing_exclusions = [
+    still_missing_exclusions = [
         term
         for term in required_title_exclusions
         if query_has_title_term(current_query, term)
         and not query_has_title_term(proposed, term)
     ]
-    if missing_exclusions:
+    if still_missing_exclusions:
         return (
             None,
-            "the proposed query dropped explicit title exclusion(s): "
-            + ", ".join(missing_exclusions),
+            "the query budget could not preserve mandatory title filter(s): "
+            + ", ".join(still_missing_exclusions),
         )
     return proposed, acceptance_status
 
@@ -2475,7 +2499,10 @@ def remove_low_priority_or_alternative(query: str) -> str | None:
     if not candidates:
         return None
 
-    _, _, last_or = max(candidates, key=lambda item: (item[0], item[1]))
+    # Positive search alternatives are expendable; NOT groups are operational
+    # guardrails and must be the last resort when fitting a query to PubMed's
+    # encoded-size budget.
+    _, _, last_or = max(candidates, key=lambda item: (not item[0], item[1]))
     containing_ends = [
         end
         for start, end in parenthesized_query_spans(query)
@@ -3009,6 +3036,13 @@ or comprehensively review broad theories/models/process accounts of human
 intelligence or general intelligence. Neural or cognitive process theories of
 general intelligence are in scope.
 
+Also approve genuinely comprehensive, integrative reviews of the broad
+psychometric structure, cognitive architecture, neural mechanisms,
+developmental origins, or biological basis of general human intelligence when
+they synthesize evidence across multiple components or explanatory levels. A
+paper does not need to advertise a named "theory" in its title if the review
+substantively explains what general intelligence is made of or how it works.
+
 Strong positive examples:
 - "Network Neuroscience Theory of Human Intelligence"
 - "Thinking as Analogy-Making: Toward a Neural Process Account of General
@@ -3096,7 +3130,9 @@ found and only a few search rounds remain, favor a defensible increase in recall
 When enough relevant unseen candidates are flowing or the download target is
 nearly met, favor precision. Page-count failures are evidence that the search
 may need terminology associated with substantial reviews, but never invent a
-PubMed page-count filter because PubMed has none.
+PubMed page-count filter because PubMed has none. Records in pagination_evidence
+were excluded from download eligibility, not judged irrelevant; their titles may
+still reveal useful vocabulary for improving recall.
 
 The improved query must use valid PubMed syntax, stay within
 {max_query_length:,} URL-encoded bytes, and preserve every operational hard
@@ -3852,7 +3888,22 @@ def build_adaptive_search_context(
         decisions.update(selection.decisions)
     approved: list[dict[str, str]] = []
     rejected: list[dict[str, str]] = []
+    known_short: list[dict[str, Any]] = []
+    minimum_pages = int((task_progress or {}).get("minimum_pdf_pages", 0))
     for article in articles:
+        page_estimate = pagination_page_count(article.pagination)
+        if (
+            page_estimate is not None
+            and minimum_pages > 0
+            and page_estimate < minimum_pages
+        ):
+            known_short.append(
+                {
+                    "pmid": article.pmid,
+                    "title": article.title,
+                    "medline_page_estimate": page_estimate,
+                }
+            )
         decision = decisions.get(article.pmid)
         if not decision:
             continue
@@ -3897,6 +3948,11 @@ def build_adaptive_search_context(
             "rejected_count": len(rejected),
             "approved_examples": approved[-20:],
             "rejected_examples": [*rejected[:25], *rejected[-15:]],
+        },
+        # These records were not LLM-rejected. They are supplied only as query
+        # evidence because MEDLINE pagination made them ineligible for download.
+        "pagination_evidence": {
+            "known_page_count_records": known_short[-40:],
         },
         "task_progress": dict(task_progress or {}),
         "previous_run_context": previous_context,
@@ -3993,6 +4049,8 @@ def print_round_statistics(
             f"  Metadata failures: {delta('metadata_missing'):,}",
             f"  Rejected by local title filters: {delta('title_excluded'):,}",
             f"  Rejected for length: {rejected_for_length:,}",
+            f"    From MEDLINE pagination: {delta('metadata_short'):,}",
+            f"    After PDF verification: {delta('pdf_short'):,}",
             f"  Sent to LLM: {screened:,}",
             f"  Rejected by LLM: {llm_rejected:,}",
             f"  Eligible after LLM: {max(0, screened - llm_rejected):,}",
@@ -4111,6 +4169,19 @@ def discover_pdf_candidates(
         except PubMedleyError as exc:
             errors.append(f"PMC AWS lookup: {compact_error(exc)}")
 
+    # Europe PMC's REST response exposes provider-approved free-PDF URLs even
+    # for some manuscripts that are in PMC but absent from the OA bulk subset.
+    # Try it before the older PMC HTML/canonical fallbacks.
+    try:
+        europe_pmc_candidates, europe_pmc_metadata = (
+            discover_europe_pmc_links(client, article)
+        )
+        candidates.extend(europe_pmc_candidates)
+        discovery_metadata["europe_pmc"] = europe_pmc_metadata
+    except PubMedleyError as exc:
+        errors.append(f"Europe PMC lookup: {compact_error(exc)}")
+
+    if article.pmcid:
         try:
             oa_candidates, oa_metadata = discover_pmc_oa_links(client, article.pmcid)
             candidates.extend(oa_candidates)
@@ -4438,6 +4509,105 @@ def discover_pmc_aws_links(
         "available": bool(candidates),
         "pmcid": base_pmcid,
         "versions": [version for version, _ in versioned],
+    }
+
+
+def discover_europe_pmc_links(
+    client: HttpClient,
+    article: Article,
+) -> tuple[list[PdfCandidate], dict[str, Any]]:
+    """Return exact free-PDF links reported by Europe PMC's REST API."""
+
+    query = (
+        f"PMCID:{article.pmcid}"
+        if article.pmcid
+        else f"EXT_ID:{article.pmid} AND SRC:MED"
+    )
+    response = client.request(
+        "GET",
+        EUROPE_PMC_SEARCH_URL,
+        params={
+            "query": query,
+            "resultType": "core",
+            "format": "json",
+            "pageSize": 1,
+        },
+    )
+    try:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise PubMedleyError(f"invalid Europe PMC JSON: {exc}") from exc
+    finally:
+        response.close()
+
+    if not isinstance(payload, Mapping):
+        raise PubMedleyError("Europe PMC returned a non-object response")
+    result_list = payload.get("resultList", {})
+    if not isinstance(result_list, Mapping):
+        raise PubMedleyError("Europe PMC resultList was not an object")
+    results = result_list.get("result", [])
+    if not isinstance(results, list) or not results:
+        return [], {
+            "attempted": True,
+            "query": query,
+            "matched": False,
+            "pdf_candidate_count": 0,
+        }
+    record = results[0]
+    if not isinstance(record, Mapping):
+        raise PubMedleyError("Europe PMC result was not an object")
+
+    returned_pmcid = normalize_space(str(record.get("pmcid") or "")).upper()
+    returned_pmid = normalize_space(str(record.get("pmid") or ""))
+    exact_match = bool(
+        (article.pmcid and returned_pmcid == article.pmcid.upper())
+        or returned_pmid == article.pmid
+    )
+    if not exact_match:
+        raise PubMedleyError(
+            "Europe PMC returned a nonmatching record "
+            f"(PMID {returned_pmid or 'missing'}, "
+            f"PMCID {returned_pmcid or 'missing'})"
+        )
+
+    full_text_urls = record.get("fullTextUrlList", {})
+    rows = (
+        full_text_urls.get("fullTextUrl", [])
+        if isinstance(full_text_urls, Mapping)
+        else []
+    )
+    if isinstance(rows, Mapping):
+        rows = [rows]
+    candidates: list[PdfCandidate] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("availabilityCode") or "").upper() != "F":
+                continue
+            if str(row.get("documentStyle") or "").casefold() != "pdf":
+                continue
+            url = normalize_download_url(str(row.get("url") or ""))
+            if url:
+                candidates.append(
+                    PdfCandidate(
+                        url=url,
+                        source="Europe PMC free full-text PDF",
+                    )
+                )
+    candidates = deduplicate_candidates(candidates)
+    return candidates, {
+        "attempted": True,
+        "query": query,
+        "matched": True,
+        "pmid": returned_pmid or None,
+        "pmcid": returned_pmcid or None,
+        "in_europe_pmc": str(record.get("inEPMC") or "").upper() == "Y",
+        "is_open_access": (
+            str(record.get("isOpenAccess") or "").upper() == "Y"
+        ),
+        "pdf_candidate_count": len(candidates),
     }
 
 
@@ -6415,29 +6585,76 @@ def collect_candidates_with_feedback(
                     "a broader query rather than stopping.",
                     flush=True,
                 )
-            selection = invoke_screening(
-                [],
-                query=query,
-                search_context=search_context,
-                query_refinement_only=True,
-            )
-            selections.append(selection)
             required_title_exclusions = list(
                 dict.fromkeys(
                     (*plan_required_title_exclusions(query_plan), *active_exclusions)
                 )
             )
-            evaluation = evaluate_llm_query_improvement(
-                client,
-                selection.improved_query,
-                query,
-                max_query_length=args.max_query_length,
-                required_title_exclusions=required_title_exclusions,
-                seen_pmids=seen_pmids,
+            rewrite_attempts: list[dict[str, Any]] = []
+            semantic_attempt_limit = (
+                1 if provider == "none" else args.llm_retries + 1
             )
+            selection = no_llm_screening_selection([])
+            evaluation = QueryImprovementEvaluation(
+                None,
+                "adaptive query rewriting is disabled",
+            )
+            for rewrite_attempt in range(1, semantic_attempt_limit + 1):
+                attempt_context = dict(search_context)
+                if rewrite_attempts:
+                    attempt_context["query_rewrite_validation_feedback"] = (
+                        rewrite_attempts
+                    )
+                selection = invoke_screening(
+                    [],
+                    query=query,
+                    search_context=attempt_context,
+                    query_refinement_only=True,
+                )
+                evaluation = evaluate_llm_query_improvement(
+                    client,
+                    selection.improved_query,
+                    query,
+                    max_query_length=args.max_query_length,
+                    required_title_exclusions=required_title_exclusions,
+                    seen_pmids=seen_pmids,
+                )
+                rewrite_attempts.append(
+                    {
+                        "attempt": rewrite_attempt,
+                        "proposed_query": selection.improved_query,
+                        "status": evaluation.status,
+                        "preflight_hits": evaluation.total_hits,
+                        "preflight_unseen_hits": evaluation.unseen_hits,
+                    }
+                )
+                if evaluation.accepted_query is not None or provider == "none":
+                    break
+                if rewrite_attempt < semantic_attempt_limit:
+                    print(
+                        f"WARNING: {provider_label} query rewrite "
+                        f"{rewrite_attempt}/{semantic_attempt_limit} was "
+                        f"unusable: {evaluation.status}. Retrying the rewrite "
+                        f"inside search round {round_number}; this does not "
+                        "consume another --max-rounds round.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            selections.append(selection)
             accepted_query = evaluation.accepted_query
             if accepted_query is not None:
                 query_plan.active_query_override = accepted_query
+            deterministic_expansion = False
+            if (
+                accepted_query is None
+                and provider != "none"
+                and query_plan.mode == "default"
+                and query_plan.default_query_scope
+                == DEFAULT_QUERY_SCOPE_FOCUSED
+            ):
+                query_plan.active_query_override = None
+                query_plan.default_query_scope = DEFAULT_QUERY_SCOPE_EXPANDED
+                deterministic_expansion = True
             continuation_fit = fit_pubmed_query(
                 build_query_for_plan(
                     query_plan,
@@ -6475,9 +6692,13 @@ def collect_candidates_with_feedback(
                 "accepted_improved_query": accepted_query,
                 "query_improvement_preflight_hits": evaluation.total_hits,
                 "query_improvement_preflight_unseen_hits": evaluation.unseen_hits,
+                "query_rewrite_attempts": rewrite_attempts,
                 "query_additional_exclusions": query_exclusions,
                 "next_round_additional_exclusions": list(active_exclusions),
                 "continuation_query": continuation_query,
+                "default_query_expanded_after_rewrite_failure": (
+                    deterministic_expansion
+                ),
                 "stop_reason": None,
             }
             query_rounds.append(round_record)
@@ -6512,10 +6733,17 @@ def collect_candidates_with_feedback(
             else:
                 print(
                     f"WARNING: Search round {round_number} did not produce a "
-                    f"usable broader query: {evaluation.status}.",
+                    f"usable broader query after {len(rewrite_attempts)} "
+                    f"attempt(s): {evaluation.status}.",
                     file=sys.stderr,
                     flush=True,
                 )
+                if deterministic_expansion:
+                    print(
+                        "Falling back to the deterministic expanded built-in "
+                        "query (MeSH plus broader Title/Abstract vocabulary).",
+                        flush=True,
+                    )
 
             if on_round is not None:
                 counts_before_round = dict(progress_counts or {})
@@ -6549,16 +6777,15 @@ def collect_candidates_with_feedback(
                     break
             if accepted_query is not None:
                 continue
+            if deterministic_expansion:
+                continue
             if provider == "none":
                 round_record["stop_reason"] = "query_exhausted_without_llm"
                 stop_reason = "query_exhausted"
                 break
-            if selection.fallback and not selection.used:
-                round_record["stop_reason"] = "llm_query_refinement_failed"
-                stop_reason = "no_unseen_records"
-                break
-            round_record["stop_reason"] = "query_refinement_will_retry"
-            continue
+            round_record["stop_reason"] = "query_refinement_exhausted"
+            stop_reason = "query_refinement_exhausted"
+            break
 
         print(
             f"Search round {round_number}: PubMed found {total_hits:,}; "
@@ -6597,8 +6824,10 @@ def collect_candidates_with_feedback(
             screenable.append(article)
         all_screenable.extend(screenable)
         print(
-            f"Search round {round_number}: MEDLINE pagination skipped "
-            f"{short_count:,} short record(s); local title exclusions rejected "
+            f"Search round {round_number}: MEDLINE pagination made "
+            f"{short_count:,} record(s) ineligible under "
+            f"--min-length={args.min_length}; these are not LLM rejections and "
+            "do not count as download tries. Local title filters rejected "
             f"{len(locally_excluded_pmids):,}; sending {len(screenable):,} "
             f"length-possible record(s) to {provider_label}.",
             flush=True,
@@ -6658,9 +6887,11 @@ def collect_candidates_with_feedback(
             current_query_exhausted
             and accepted_query is None
             and query_plan.mode == "default"
-            and query_plan.active_query_override is None
             and query_plan.default_query_scope == DEFAULT_QUERY_SCOPE_FOCUSED
         ):
+            # An exhausted LLM override must not strand the built-in search in
+            # focused mode. Drop it and make the deterministic recall expansion.
+            query_plan.active_query_override = None
             query_plan.default_query_scope = DEFAULT_QUERY_SCOPE_EXPANDED
             expanded_for_next_round = True
 
@@ -7228,7 +7459,6 @@ def process_candidate_round(
             reason = "; ".join(errors) or "PDF download failed"
             retrieval["failure_reason"] = reason
             if too_short:
-                outputs.failure(article.title, article.pubmed_url, reason)
                 tqdm.write(
                     f"[TOO SHORT] {article.title}: {reason}",
                     file=sys.stdout,
@@ -7498,6 +7728,14 @@ def run(args: argparse.Namespace) -> int:
                 f"{len(screenable_articles):,} length-possible candidate(s).",
                 flush=True,
             )
+            if counts["metadata_short"]:
+                print(
+                    f"Important: {counts['metadata_short']:,} additional "
+                    f"record(s) were excluded by --min-length={args.min_length} "
+                    "before LLM screening. The approval count is therefore "
+                    "not a count of all relevant records in PubMed.",
+                    flush=True,
+                )
 
         print(
             "Finished: "
@@ -7522,24 +7760,41 @@ def run(args: argparse.Namespace) -> int:
         print(f"Stop reason: {search_result.stop_reason}.", flush=True)
         if (
             search_result.stop_reason
-            in {"query_exhausted", "no_unseen_records"}
+            in {
+                "query_exhausted",
+                "no_unseen_records",
+                "query_refinement_exhausted",
+            }
             and counts["downloaded"] < args.max_articles
             and counts["tries"] < args.max_tries
         ):
-            query_description = (
-                "the expanded built-in query"
-                if query_plan.mode == "default"
-                else "the configured query"
-            )
-            print(
-                "Search space exhausted before the download limits: every "
-                f"PubMed record matching {query_description} was already "
-                "classified. --max-tries and --max-articles are ceilings, "
-                "not guaranteed totals. Broaden --query/--query-yaml, increase "
-                "--max-age, or lower --min-length to search a larger pool.",
-                file=sys.stderr,
-                flush=True,
-            )
+            if search_result.stop_reason == "query_refinement_exhausted":
+                print(
+                    "The active PubMed query was exhausted and the LLM could "
+                    "not produce a validated replacement containing unseen "
+                    "PMIDs after its rewrite retries. PubMedley stopped instead "
+                    "of wasting later rounds on the same records. Relaunch from "
+                    "the continuation query, increase --max-age, lower "
+                    "--min-length, or provide a broader --query/--query-yaml.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                query_description = (
+                    "the expanded built-in query"
+                    if query_plan.mode == "default"
+                    else "the configured query"
+                )
+                print(
+                    "Search space exhausted before the download limits: every "
+                    f"PubMed record matching {query_description} was already "
+                    "classified. --max-tries and --max-articles are ceilings, "
+                    "not guaranteed totals. Broaden --query/--query-yaml, "
+                    "increase --max-age, or lower --min-length to search a "
+                    "larger pool.",
+                    file=sys.stderr,
+                    flush=True,
+                )
         applied_rewrites = [
             record
             for record in search_result.query_rounds
@@ -7560,7 +7815,10 @@ def run(args: argparse.Namespace) -> int:
         else:
             print("No LLM query rewrite was applied.", flush=True)
         print(f"Success list: {success_path}", flush=True)
-        print(f"Failure list: {failure_path}", flush=True)
+        print(
+            f"Failure list (genuine retrieval failures only): {failure_path}",
+            flush=True,
+        )
         print(f"Metadata: {metadata_path}", flush=True)
         print(f"LLM report: {llm_report_path}", flush=True)
         print(f"Continuation state: {continuation_state_path}", flush=True)

@@ -28,7 +28,7 @@ Single call pipeline to:
   * Without this flag, missing credentials or failed/incomplete LLM screening is fatal; PubMedley will not silently approve everything.
 * `--pmc-only` - restrict results to articles available in PubMed Central
 * `--retries 3` - HTTP/PDF retries after the initial attempt
-* `--llm-retries 3` - LLM retries after the initial call, with 1, 2, and 4 second waits by default
+* `--llm-retries 3` - LLM/API retries after the initial call, with 1, 2, and 4 second waits by default; unusable exhausted-query rewrites are also retried inside the same search round
 * `--timeout 60` - seconds
 * `--ncbi-api-key <NCBI_API_KEY>` - not required but allows for faster throughput
 * `S2_API_KEY` environment variable - optional Semantic Scholar API key; anonymous lookups are supported but share a public rate limit
@@ -37,7 +37,7 @@ Single call pipeline to:
 * `--max-articles 20` - maximum number of files you want downloaded at the end
 * `--max-tries 100` - Maximum number of qualifying-length download outcomes.
   * For example, say you want 20 files, to prevent it from running forever if it keeps failing to download, set this for how many it will try before giving up.
-  * A PDF verified below `--min-length` is written to the failure list with its page-count reason, but does not consume a try.
+  * A PDF verified below `--min-length` is recorded in metadata and stdout, but is not a download failure and does not consume a try.
 * `--max-rounds 10` - The absolute maximum number of search/filter/download or exhausted-query-refinement rounds that will be performed before it quits.
   * For example, say every round LLM filtered out all but a couple articles, if after max-rounds you still haven't hit the max tries or max articles it will give up
     * When it gives up, it will print the current query so you can relaunch and specify the exact query to pick up where you left off.
@@ -46,7 +46,7 @@ Single call pipeline to:
 
 ### Output
 * Pipeline writes the following files that can be configured
-  * `--failure-list failed_to_download.ls` - list of which articles failed to download, one article per line
+  * `--failure-list failed_to_download.ls` - genuine PDF retrieval failures, one article per line; verified-short PDFs are not mislabeled as failures
   * `--metadata article_metadata.jsonl` - information about article metadata as list of JSON for articles; browser failures include each attempted page, HTTP status, PDF-looking link/request, matching control, and rejection reason under `retrieval.browser.attempts`
   * `--success-list retrieved_articles.ls` - List of articles that were successfully downloaded, one article per line
   * `--llm-report llm_screening.json` - info about the LLM call results
@@ -98,16 +98,18 @@ Single call pipeline to:
 3. Preliminary page count filter
 4. [ONLY WITH LLM CREDENTIALS] Send candidate metadata, the exact active PubMed query, the research explanation, screening instructions, prior decisions, and live task progress to the LLM
   * The LLM returns a relevance decision for every PMID, one complete improved PubMed query, and a short reason for the rewrite
+  * The active LLM schema does not request exclusion phrases; old empty `suggested_exclusions` report fields remain only for backward compatibility
   * Task progress includes requested/completed downloads, tries used/remaining, short PDFs, failures, and search rounds remaining so the LLM can balance recall against precision
 5. Validate and preflight the proposed query
-  * PubMedley rejects malformed/oversized rewrites and rewrites that drop free-full-text, date, review/publication-type, PMC-only, or explicit title-exclusion constraints
+  * PubMedley rejects malformed/oversized rewrites and rewrites that drop free-full-text, date, review/publication-type, or PMC-only constraints. Mandatory title filters omitted by the LLM are restored deterministically before preflight.
   * A valid rewrite is preflighted against PubMed and is accepted only if it returns at least one PMID that has not already been seen; then it becomes the exact query for the next round and continuation checkpoint
   * If a query is exhausted, a query-refinement-only LLM round asks for broader terminology instead of stopping or re-screening the same records
+  * An unusable exhausted-query rewrite is retried inside that same search round. If retries are exhausted, the default search falls back once to its deterministic expanded query; an already-expanded/custom search stops instead of wasting the remaining rounds on the same PMID set.
   * An API error, invalid JSON, or two or more omitted PMIDs is retried according to `--llm-retries`; one omitted PMID is ignored/rejected without repeating the whole LLM call
   * After retry exhaustion PubMedley stops before downloading that batch and explicitly suggests `--no-llm`
   * With explicit `--no-llm`, hard title exclusions still apply locally but semantic relevance filtering and adaptive query rewrites are disabled
 6. Check for existing PDF (If article has already been downloaded skip)
-7. For PMC articles, try the current anonymous PMC AWS Open Data route, legacy PMC OA service, and PMC page/canonical routes
+7. Try PMC AWS Open Data first when a PMCID exists, then query Europe PMC's REST API for an explicitly reported free-PDF URL, then use the legacy PMC OA service and PMC page/canonical routes
 8. For recognized Elsevier records, use the official Article Retrieval API when `ELSEVIER_API_KEY` is configured
 9. Ask Unpaywall (when `--email` is configured) and Semantic Scholar for explicit legal open-access PDF locations, preferring repository copies that avoid publisher bot walls
 10. Try the DOI publisher page and any PDF links it exposes over HTTP
@@ -122,5 +124,5 @@ Single call pipeline to:
 ## PDF retrieval
 * PMC is removing legacy FTP/OA PDF structure in August 2026
   * New method is AWS Open Data service for programmatic PDF retrieval
-* Code currently supports both, supplements them with Unpaywall and Semantic Scholar OA locations, and uses headless Chrome/Chromium as a final backup
+* Code currently supports both, supplements them with Europe PMC, Unpaywall, and Semantic Scholar free/OA locations, and uses headless Chrome/Chromium as a final backup
 * `pypdf` runs in repair-friendly mode for page counting. The repetitive duplicate-dictionary `/MediaBox` warning from malformed-but-readable PDFs is suppressed; actual parser failures are still reported.
